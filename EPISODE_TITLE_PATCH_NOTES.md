@@ -94,3 +94,16 @@ Recommended settings remain:
 - Strict: Off
 - Similarity Threshold: 0.82
 - Request Types: anime, series
+
+
+## V7 - Move requested-title early allow after raw mismatch checks
+
+v6 source still allowed streams too early when the candidate/display text matched the requested episode title. Some addon/formatter text can include the requested metadata title even when the raw filename is a different OVA/special/spin-off. v7 removes that early return before mismatch-only checks and only allows requested episode-title matches after the raw filename OVA/special/movie rejection has had a chance to run.
+
+Recommended settings remain:
+
+- Episode Title Matching: Enabled
+- Matching Mode: Mismatch Only
+- Strict: Off
+- Similarity Threshold: 0.82
+- Request Types: anime, series

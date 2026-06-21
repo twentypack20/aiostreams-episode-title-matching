@@ -1229,9 +1229,10 @@ class StreamFilterer {
         titleMatches(normalisedRawFilename, normalisedRequestedEpisodeTitle, threshold) ||
         titleMatches(rawFilenameReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
 
-      if (hasRequestedEpisodeTitle) {
-        return true;
-      }
+      // Do not return early on hasRequestedEpisodeTitle here.
+      // The formatted/display text can contain the requested episode title even when
+      // the raw filename is a different OVA/special/spin-off. Run mismatch-only
+      // raw-filename checks first, then allow requested episode title matches later.
 
       const conflictingTitle = requestedMetadata?.seasonEpisodeTitles?.find(
         (episodeInfo) => {
@@ -1335,6 +1336,10 @@ class StreamFilterer {
           );
           return false;
         }
+      }
+
+      if (hasRequestedEpisodeTitle) {
+        return true;
       }
 
       if (!episodeTitleMatchingOptions.strict && avoidStrictEpisodeTitleRequirement) {
