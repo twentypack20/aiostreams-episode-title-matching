@@ -185,6 +185,7 @@ export interface FormatterContext {
   queryType?: string;
   season?: number;
   episode?: number;
+  episodeTitle?: string;
   title?: string;
   titles?: string[];
   year?: number;
