@@ -154,11 +154,19 @@ V11 correctly rejects likely subtitle-only English tags for non-English anime wh
 
 V12 allows `Unknown`, `Multi`, or `Original` language metadata to satisfy required English only when the requested content metadata says the original language is English. Explicit non-English parsed languages such as Russian or Italian are still rejected when English is required.
 
-## v13 - Anime specials language + special numbering fallback
 
-- Allows anime streams with `Dual Audio` or `Dubbed` to satisfy an English requirement when no explicit English tag is parsed, unless explicit non-English-only language tags are present.
-- Keeps the v11/v12 subtitle-only guard for `GB / ES / FR / PT` style anime streams without real English-audio evidence.
-- Loosens season/episode matching for anime special-like requests (`Special`, OVA/OAD/ONA, Tales, Visions, Digression, Journal, movie/film titles, Coleus/Veldora/Scarlet Bond) when the candidate filename/folder looks like the requested special. This prevents valid specials from being removed only because metadata providers disagree on S00/S01/special episode numbering.
-- Adds debug markers:
-  - `shouldAllowAnimeLikelyEnglishAudioAliasStream`
-  - `Season/episode matching allowed loose anime special episode mismatch`
+## v14 - Anime special unknown-language fallback
+
+v13 fixed most anime specials by loosening special season/episode matching and allowing `Dual Audio` / `Dubbed` to satisfy English-required anime streams.
+
+v14 adds a narrow last-resort fallback for anime specials/movie-style entries where the only cached candidate is parsed as `Unknown` language even though it looks like the requested special. This is intentionally limited to anime special/movie requests and does not allow `Unknown` globally or for normal anime episodes.
+
+Recommended settings remain:
+
+- Required Languages: English, Dual Audio, Dubbed
+- Episode Title Matching: Enabled
+- Episode Title Matching Mode: Mismatch Only
+- Episode Title Matching Strict: Off
+- Episode Title Matching Request Types: anime
+- Season/Episode Matching: Enabled
+- Exclude Uncached: Enabled
