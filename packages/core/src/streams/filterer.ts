@@ -968,6 +968,52 @@ class StreamFilterer {
         ? Number(parsedId.episode)
         : undefined;
 
+      // v13: Anime specials/OVAs are often numbered differently across metadata
+      // providers, AniDB/TVDB order, and torrent filenames. A valid requested
+      // special can be published as S00Exx, S01Exx, OVA/OAD, "Tales", "Visions",
+      // "Digression", "Part 1", etc. Let obvious special-title candidates pass
+      // season/episode matching and rely on episode-title/language/cache filters
+      // later, instead of killing them here solely because the number differs.
+      const requestedEpisodeTitleNormalised = requestedEpisodeTitle
+        ? normaliseTitle(requestedEpisodeTitle)
+        : '';
+      const requestedTitleLooksAnimeSpecial =
+        isAnime &&
+        !!requestedEpisodeTitle &&
+        (requestedSeason === 0 ||
+          /\b(ova|oad|ona|specials?|extra|bonus|digressions?|tales?|visions?|journals?|movie|film|coleus|veldora|scarlet[ ._-]?bond)\b/i.test(
+            requestedEpisodeTitle
+          ));
+      const streamSpecialIdentityText = [
+        stream.filename,
+        stream.folderName,
+        stream.originalName,
+        stream.parsedFile?.title,
+      ]
+        .filter((value): value is string =>
+          typeof value === 'string' && value.trim().length > 0
+        )
+        .join(' ');
+      const streamSpecialIdentityNormalised = normaliseTitle(
+        streamSpecialIdentityText
+      );
+      const streamLooksLikeRequestedAnimeSpecial =
+        requestedTitleLooksAnimeSpecial &&
+        !!streamSpecialIdentityText &&
+        ((requestedEpisodeTitleNormalised &&
+          (streamSpecialIdentityNormalised.includes(
+            requestedEpisodeTitleNormalised
+          ) ||
+            partial_ratio(
+              streamSpecialIdentityNormalised,
+              requestedEpisodeTitleNormalised
+            ) /
+              100 >=
+              0.82)) ||
+          /\b(ova|oad|ona|specials?|extra|bonus|digressions?|tales?|visions?|journals?|movie|film|coleus|veldora|scarlet[ ._-]?bond)\b/i.test(
+            streamSpecialIdentityText
+          ));
+
       if (
         seasonEpisodeMatchingOptions.requestTypes?.length &&
         (!seasonEpisodeMatchingOptions.requestTypes.includes(type) ||
@@ -1036,6 +1082,17 @@ class StreamFilterer {
           )
         ) {
           // allow if relative absolute episode (AniDB episode) matches AND season is 1
+        } else if (streamLooksLikeRequestedAnimeSpecial) {
+          logEpisodeTitleDebug('Season/episode matching allowed loose anime special season mismatch', {
+            filename: stream.filename,
+            folderName: stream.folderName,
+            parsedTitle: stream.parsedFile?.title,
+            parsedSeasons: stream.parsedFile?.seasons,
+            parsedEpisodes: stream.parsedFile?.episodes,
+            requestedSeason,
+            requestedEpisode,
+            requestedEpisodeTitle,
+          });
         } else {
           return false;
         }
@@ -1062,6 +1119,17 @@ class StreamFilterer {
           (!seasons?.length || seasons[0] === 1)
         ) {
           // allow if relative absolute episode (AniDB episode) matches AND (no season OR season is 1)
+        } else if (streamLooksLikeRequestedAnimeSpecial) {
+          logEpisodeTitleDebug('Season/episode matching allowed loose anime special episode mismatch', {
+            filename: stream.filename,
+            folderName: stream.folderName,
+            parsedTitle: stream.parsedFile?.title,
+            parsedSeasons: stream.parsedFile?.seasons,
+            parsedEpisodes: stream.parsedFile?.episodes,
+            requestedSeason,
+            requestedEpisode,
+            requestedEpisodeTitle,
+          });
         } else {
           return false;
         }
@@ -1855,6 +1923,47 @@ class StreamFilterer {
       return languages.every((lang) => allowedVagueLanguages.has(lang));
     };
 
+    const shouldAllowAnimeLikelyEnglishAudioAliasStream = (
+      stream: ParsedStream
+    ): boolean => {
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (!isAnime) return false;
+      if (!originalLanguage || originalLanguage === 'English') return false;
+
+      const languages = stream.parsedFile?.languages?.length
+        ? stream.parsedFile.languages
+        : ['Unknown'];
+      const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
+
+      // v13: anime specials often only parse as "Dual Audio"/"Dubbed" without
+      // an explicit English language tag. Treat those as English-audio evidence
+      // unless there are explicit non-English language tags besides the original
+      // language and vague aliases. This keeps subtitle-only GB/ES/FR/PT-style
+      // releases blocked while allowing cached dual-audio specials through.
+      if (!languageSet.has('dual audio') && !languageSet.has('dubbed')) {
+        return false;
+      }
+
+      const originalLanguageLower = originalLanguage.toLowerCase();
+      const allowedAliases = new Set([
+        'unknown',
+        'multi',
+        'original',
+        'dual audio',
+        'dubbed',
+        originalLanguageLower,
+      ]);
+
+      const explicitNonEnglishLanguages = languages.filter((lang) => {
+        const lower = lang.toLowerCase();
+        return lower !== 'english' && !allowedAliases.has(lower);
+      });
+
+      return explicitNonEnglishLanguages.length === 0;
+    };
+
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
 
@@ -2352,7 +2461,8 @@ class StreamFilterer {
         !this.userData.requiredLanguages.some((lang) =>
           (file?.languages.length ? file.languages : ['Unknown']).includes(lang)
         ) &&
-        !shouldAllowUnknownEnglishOriginalStream(stream)
+        !shouldAllowUnknownEnglishOriginalStream(stream) &&
+        !shouldAllowAnimeLikelyEnglishAudioAliasStream(stream)
       ) {
         this.incrementRemovalReason(
           'requiredLanguage',
@@ -2366,6 +2476,19 @@ class StreamFilterer {
         shouldAllowUnknownEnglishOriginalStream(stream)
       ) {
         logEpisodeTitleDebug('Language filter allowed English-original stream with vague language metadata', {
+          filename: stream.filename,
+          folderName: stream.folderName,
+          originalName: stream.originalName,
+          parsedLanguages: file?.languages,
+          originalLanguage,
+        });
+      }
+
+      if (
+        !skipLanguageFiltering &&
+        shouldAllowAnimeLikelyEnglishAudioAliasStream(stream)
+      ) {
+        logEpisodeTitleDebug('Language filter allowed anime likely-English audio alias stream', {
           filename: stream.filename,
           folderName: stream.folderName,
           originalName: stream.originalName,
