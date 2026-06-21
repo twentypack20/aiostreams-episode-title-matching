@@ -107,3 +107,8 @@ Recommended settings remain:
 - Strict: Off
 - Similarity Threshold: 0.82
 - Request Types: anime, series
+
+
+## V8 - Episode title debug logging
+
+Adds opt-in debug logging with `EPISODE_TITLE_DEBUG=true` to print the exact stream fields and episode-title matching decisions. This is intended to diagnose cases where a visible stream title/episode does not match the raw filename fields used by the filter, or where an addon sets passthrough behaviour before episode-title matching runs.

@@ -350,6 +350,7 @@ class StreamFilterer {
     context: StreamContext
   ): Promise<ParsedStream[]> {
     const { type, id, parsedId, isAnime } = context;
+    const episodeTitleDebug = process.env.EPISODE_TITLE_DEBUG === 'true';
 
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
@@ -400,6 +401,19 @@ class StreamFilterer {
     const episodeTitleFromDetails = await context.getEpisodeTitle();
     const requestedEpisodeTitle =
       requestedMetadata?.episodeTitle ?? episodeTitleFromDetails;
+    const logEpisodeTitleDebug = (message: string, extra: Record<string, unknown> = {}) => {
+      if (!episodeTitleDebug) return;
+      logger.info(message, {
+        id,
+        type,
+        isAnime,
+        requestedTitle: requestedMetadata?.title,
+        requestedEpisodeTitle,
+        season: parsedId?.season,
+        episode: parsedId?.episode,
+        ...extra,
+      });
+    };
     metadataMs = Date.now() - metadataStart;
     if (metadataMs > 10) {
       logger.debug(
@@ -1066,11 +1080,37 @@ class StreamFilterer {
         ...(this.userData.episodeTitleMatching ?? {}),
       };
 
+      logEpisodeTitleDebug('Episode title matching check started', {
+        addon: stream.addon?.name,
+        addonPresetId: stream.addon?.preset?.id,
+        filename: stream.filename,
+        folderName: stream.folderName,
+        originalName: stream.originalName,
+        indexer: stream.indexer,
+        streamType: stream.type,
+        service: stream.service,
+        parsedTitle: stream.parsedFile?.title,
+        parsedSeasons: stream.parsedFile?.seasons,
+        parsedEpisodes: stream.parsedFile?.episodes,
+        parsedSeasonPack: stream.parsedFile?.seasonPack,
+        parsedLanguages: stream.parsedFile?.languages,
+        parsedResolution: stream.parsedFile?.resolution,
+        passthroughs: stream.passthrough,
+        episodeTitleMatchingOptions,
+      });
+
       if (!episodeTitleMatchingOptions.enabled) {
+        logEpisodeTitleDebug('Episode title matching bypassed: disabled', { filename: stream.filename, parsedTitle: stream.parsedFile?.title });
         return true;
       }
 
       if (!parsedId || !requestedEpisodeTitle) {
+        logEpisodeTitleDebug('Episode title matching bypassed: missing parsedId or requested episode title', {
+          filename: stream.filename,
+          parsedTitle: stream.parsedFile?.title,
+          hasParsedId: !!parsedId,
+          hasRequestedEpisodeTitle: !!requestedEpisodeTitle,
+        });
         return true;
       }
 
@@ -1082,6 +1122,12 @@ class StreamFilterer {
         : undefined;
 
       if (!requestedSeason || !requestedEpisode) {
+        logEpisodeTitleDebug('Episode title matching bypassed: missing requested season or episode', {
+          filename: stream.filename,
+          parsedTitle: stream.parsedFile?.title,
+          requestedSeason,
+          requestedEpisode,
+        });
         return true;
       }
 
@@ -1091,6 +1137,11 @@ class StreamFilterer {
           (isAnime &&
             !episodeTitleMatchingOptions.requestTypes.includes('anime')))
       ) {
+        logEpisodeTitleDebug('Episode title matching bypassed: request type not enabled', {
+          filename: stream.filename,
+          parsedTitle: stream.parsedFile?.title,
+          requestTypes: episodeTitleMatchingOptions.requestTypes,
+        });
         return true;
       }
 
@@ -1098,6 +1149,12 @@ class StreamFilterer {
         episodeTitleMatchingOptions.addons?.length &&
         !episodeTitleMatchingOptions.addons.includes(stream.addon.preset.id)
       ) {
+        logEpisodeTitleDebug('Episode title matching bypassed: addon not selected', {
+          filename: stream.filename,
+          parsedTitle: stream.parsedFile?.title,
+          addonPresetId: stream.addon?.preset?.id,
+          configuredAddons: episodeTitleMatchingOptions.addons,
+        });
         return true;
       }
 
@@ -1278,6 +1335,31 @@ class StreamFilterer {
       const hasAnimeExtraSignal = extraSignalPattern.test(rawIdentityText);
       const hasFilenameAnimeExtraSignal = extraSignalPattern.test(rawFilenameText || rawIdentityText);
 
+      logEpisodeTitleDebug('Episode title matching computed fields', {
+        filename: stream.filename,
+        folderName: stream.folderName,
+        originalName: stream.originalName,
+        parsedTitle: stream.parsedFile?.title,
+        rawFilenameText,
+        rawIdentityText,
+        primaryCandidateText,
+        normalisedCandidate,
+        normalisedPrimaryCandidate,
+        normalisedRawFilename,
+        normalisedRawIdentity,
+        rawReleaseTitle,
+        rawFilenameReleaseTitle,
+        requestTitles,
+        requestPrimaryTitles,
+        normalisedRequestedEpisodeTitle,
+        hasRequestedSeriesTitle,
+        hasRequestedPrimarySeriesTitleInFilename,
+        hasRequestedEpisodeTitle,
+        hasRequestedEpisodeTitleInFilename,
+        hasAnimeExtraSignal,
+        hasFilenameAnimeExtraSignal,
+      });
+
       const releaseTitleLooksMeaningful =
         rawReleaseTitleWords.length >= 2 &&
         !rawReleaseTitleWords.every((word) => /^\d+$/.test(word));
@@ -1339,10 +1421,24 @@ class StreamFilterer {
       }
 
       if (hasRequestedEpisodeTitle) {
+        logEpisodeTitleDebug('Episode title matching allowed: requested episode title matched after mismatch checks', {
+          filename: stream.filename,
+          parsedTitle: stream.parsedFile?.title,
+          rawFilenameText,
+          rawIdentityText,
+        });
         return true;
       }
 
       if (!episodeTitleMatchingOptions.strict && avoidStrictEpisodeTitleRequirement) {
+        logEpisodeTitleDebug('Episode title matching allowed: non-strict pack/multi-episode passthrough', {
+          filename: stream.filename,
+          parsedTitle: stream.parsedFile?.title,
+          parsedEpisodes: stream.parsedFile?.episodes,
+          parsedSeasonPack: stream.parsedFile?.seasonPack,
+          rawFilenameText,
+          rawIdentityText,
+        });
         return true;
       }
 
@@ -2409,6 +2505,20 @@ class StreamFilterer {
           this.incrementRemovalReason('seasonEpisodeMatching', detail);
           return false;
         }
+      }
+
+      if (shouldPassthroughStage(stream, 'episodeTitle')) {
+        logEpisodeTitleDebug('Episode title matching bypassed: stream has episodeTitle passthrough stage', {
+          addon: stream.addon?.name,
+          addonPresetId: stream.addon?.preset?.id,
+          filename: stream.filename,
+          folderName: stream.folderName,
+          originalName: stream.originalName,
+          parsedTitle: stream.parsedFile?.title,
+          parsedSeasons: stream.parsedFile?.seasons,
+          parsedEpisodes: stream.parsedFile?.episodes,
+          passthroughs: stream.passthrough,
+        });
       }
 
       if (!shouldPassthroughStage(stream, 'episodeTitle')) {
