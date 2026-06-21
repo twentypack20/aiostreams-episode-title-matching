@@ -1764,6 +1764,70 @@ class StreamFilterer {
       }
     };
 
+    const normaliseLooseText = (value: string | undefined): string =>
+      (value ?? '')
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+
+    const hasStrongEnglishAudioSignal = (stream: ParsedStream): boolean => {
+      const file = stream.parsedFile;
+      const languages = file?.languages ?? [];
+      const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
+      const originalLanguageLower = originalLanguage?.toLowerCase();
+
+      if (languageSet.has('dual audio') || languageSet.has('dubbed')) {
+        return true;
+      }
+
+      if (languageSet.has('original') && languageSet.has('english')) {
+        return true;
+      }
+
+      if (
+        originalLanguageLower &&
+        originalLanguageLower !== 'english' &&
+        languageSet.has(originalLanguageLower) &&
+        languageSet.has('english')
+      ) {
+        return true;
+      }
+
+      const haystack = normaliseLooseText(
+        [
+          stream.filename,
+          stream.folderName,
+          stream.originalName,
+          file?.title,
+          file?.releaseGroup,
+        ]
+          .filter(Boolean)
+          .join(' ')
+      );
+
+      return /\b(dual audio|dual audio eng|multi audio|multi audio eng|dubbed|english dub|eng dub|dub eng|en dub|dub)\b/.test(
+        haystack
+      );
+    };
+
+    const shouldRejectLikelySubtitleOnlyEnglishAnime = (
+      stream: ParsedStream
+    ): boolean => {
+      const file = stream.parsedFile;
+      const languages = file?.languages?.length ? file.languages : ['Unknown'];
+
+      if (!isAnime) return false;
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (!originalLanguage || originalLanguage === 'English') return false;
+      if (!languages.includes('English' as any)) return false;
+
+      return !hasStrongEnglishAudioSignal(stream);
+    };
+
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
 
@@ -2266,6 +2330,26 @@ class StreamFilterer {
           'requiredLanguage',
           file?.languages.length ? file.languages.join(', ') : 'Unknown'
         );
+        return false;
+      }
+
+      if (
+        !skipLanguageFiltering &&
+        shouldRejectLikelySubtitleOnlyEnglishAnime(stream)
+      ) {
+        const langs = file?.languages.length ? file.languages.join(', ') : 'Unknown';
+        this.incrementRemovalReason(
+          'requiredLanguage',
+          `${langs} (English audio not confirmed; likely subtitle-only language tag)`
+        );
+        logEpisodeTitleDebug('Language filter rejected likely subtitle-only English anime stream', {
+          filename: stream.filename,
+          folderName: stream.folderName,
+          originalName: stream.originalName,
+          parsedLanguages: file?.languages,
+          parsedSubtitles: file?.subtitles,
+          originalLanguage,
+        });
         return false;
       }
 

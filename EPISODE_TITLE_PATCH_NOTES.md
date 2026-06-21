@@ -133,3 +133,16 @@ This should reject `Ple Ple Pleiades OVA Clementine The Fugitive Part 3.mkv` for
 V9 still let some spin-off files through because `hasRequestedPrimarySeriesTitleInFilenameOnly` included `parsedTitle`, and the parser could infer `Overlord` from the surrounding folder/batch even when the literal filename was `Ple Ple Pleiades OVA...`.
 
 V10 adds stricter actual-filename-only checks that use only the literal filename and the release title extracted from that filename. The OVA/special/movie rejection now uses those stricter checks before non-strict pack passthrough.
+
+
+## V11 - Subtitle-only English language guard
+
+Some anime releases contain English subtitle/country tags such as `GB / ES / FR / PT` but have Japanese-only audio. AIOStreams language parsing can treat those subtitle-only filename tags as `English`, which allows them through `Required Languages: English`.
+
+v11 adds a conservative anime-only guard when `English` is required and the original language is not English:
+
+- Allow clear English-audio signals such as `Dual Audio`, `Dubbed`, `Original + English`, or both the original language and English.
+- Reject streams where English appears to be a subtitle-only filename/language tag with no audio/dub signal.
+- Record the removal under `Required Language` as `English audio not confirmed; likely subtitle-only language tag`.
+
+Keep Japanese excluded languages unset. Do not globally exclude Japanese, because good dual-audio releases usually include Japanese plus English.
