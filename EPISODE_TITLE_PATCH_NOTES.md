@@ -33,3 +33,64 @@ corepack enable
 pnpm install
 pnpm run build
 ```
+
+## v2: Different-title / spin-off detection
+
+This update improves `Episode Title Matching` in `Mismatch Only` mode. The v1 logic could remove streams that matched a different known episode title, but it was too conservative for spin-off / OVA false positives such as a normal `Overlord` episode returning a `Ple Ple Pleiades OVA` file.
+
+The v2 logic adds a generic raw-filename check:
+
+- It uses the raw filename / folder / parsed title, not addon display descriptions that may contain the requested metadata title.
+- It strips common release noise such as release groups, quality tags, codecs, years, sizes, and SxxExx/episode markers to estimate the actual candidate title.
+- It allows normal releases that contain the requested series title or requested episode title.
+- It allows season packs and multi-episode packs when strict mode is off.
+- It rejects streams that look like a different title, OVA, special, recap, movie, spin-off, chibi/omake, trailer, etc. for the requested episode.
+- It does not rely on franchise-specific regex patterns.
+
+Recommended settings remain:
+
+- Episode Title Matching: Enabled
+- Mode: Mismatch Only
+- Strict: Off
+- Similarity Threshold: 0.82
+- Request Types: anime, series
+
+## v3 - Pack/OVA mismatch pass
+
+v2 still skipped some Ple/Pure Pleiades false positives in mismatch-only mode because they could be parsed as multi-episode or pack-like results. v3 no longer skips multi-episode/season-pack-looking streams before the mismatch-only checks. Instead, it only avoids the final strict "must contain episode title" rejection for those pack-like results.
+
+Recommended settings remain:
+
+- Episode Title Matching: Enabled
+- Matching Mode: Mismatch Only
+- Strict: Off
+- Similarity Threshold: 0.82
+- Request Types: anime, series
+
+
+## V5 - Filename-first OVA/special rejection
+
+v4 could still allow a false positive if the parser or alias metadata made a bad stream look related to the requested series. v5 adds a filename-first pass for anime episode requests:
+
+- It inspects only the raw filename/folder/original name before trusting parsed title aliases.
+- If the raw filename contains OVA/OAD/ONA/special/movie/spin-off style signals,
+- and the raw filename does not contain the requested primary series title,
+- and the raw filename does not contain the requested episode title,
+- it rejects the stream in Mismatch Only mode.
+
+This is designed to reject files like `Ple Ple Pleiades OVA Clementine The Fugitive Part 3.mkv` for normal `Overlord S01E03`, while still allowing those files when the requested primary title is actually `Ple Ple Pleiades`.
+
+
+## V6 - Do not trust display text for mismatch-only early allow
+
+V5 still allowed some Ple/Pure Pleiades false positives because the display/formatter text could contain the requested episode title (for example, `Overlord - Battle of Carne Village`) even when the raw filename was a different OVA/special file.
+
+V6 removes that early display-text shortcut so raw filename/folder/parsed-title checks run first. Mismatch-only mode now rejects special/OVA/movie-looking raw filenames before any broad display text can make the stream look valid.
+
+Recommended settings remain:
+
+- Episode Title Matching: Enabled
+- Matching Mode: Mismatch Only
+- Strict: Off
+- Similarity Threshold: 0.82
+- Request Types: anime, series

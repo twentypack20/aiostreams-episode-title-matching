@@ -1106,32 +1106,130 @@ class StreamFilterer {
       const isMultiEpisode = episodes.length > 1;
       const isSeasonPack = !!stream.parsedFile?.seasonPack;
 
-      if (!episodeTitleMatchingOptions.strict && (isMultiEpisode || isSeasonPack)) {
-        return true;
-      }
+      // Do not skip multi-episode/season-pack-looking results entirely here.
+      // Some false positives (especially anime OVAs/specials labelled as "Part 3")
+      // can be parsed as multi-episode or pack-like. Mismatch-only mode should still
+      // get a chance to reject obvious different-title/extra-title results.
+      // We only avoid strict "must contain episode title" rejection for packs later.
+      const avoidStrictEpisodeTitleRequirement = isMultiEpisode || isSeasonPack;
 
-      const candidateText = [
+      const primaryCandidateText = [
         stream.filename,
         stream.folderName,
         stream.parsedFile?.title,
         stream.originalName,
+      ]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .join(' ');
+
+      const displayCandidateText = [
         stream.originalDescription,
         stream.message,
       ]
         .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
         .join(' ');
 
+      const candidateText = [primaryCandidateText, displayCandidateText]
+        .filter((value) => value.trim().length > 0)
+        .join(' ');
+
       if (!candidateText) {
         return true;
       }
 
-      const normalisedCandidate = normaliseTitle(candidateText);
-      const normalisedRequestedEpisodeTitle = normaliseTitle(requestedEpisodeTitle);
       const threshold = episodeTitleMatchingOptions.similarityThreshold ?? 0.82;
-      const score =
-        partial_ratio(normalisedCandidate, normalisedRequestedEpisodeTitle) / 100;
+      const normalisedCandidate = normaliseTitle(candidateText);
+      const normalisedPrimaryCandidate = normaliseTitle(primaryCandidateText || candidateText);
+      const normalisedRequestedEpisodeTitle = normaliseTitle(requestedEpisodeTitle);
+      // Do not allow display/formatter text to short-circuit mismatch checks.
+      // Some addons can include the requested episode title in display text even when
+      // the raw filename is a different OVA/special/spin-off. Raw filename checks below
+      // should get the first chance to reject those false positives.
 
-      if (score >= threshold) {
+      const requestPrimaryTitles = [requestedMetadata?.title]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .map((value) => normaliseTitle(value))
+        .filter((value, index, array) => value.length > 0 && array.indexOf(value) === index);
+
+      const requestAliasTitles = requestedMetadata?.titles
+        ?.map((title) => title.title)
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .map((value) => normaliseTitle(value))
+        .filter((value, index, array) => value.length > 0 && array.indexOf(value) === index) ?? [];
+
+      const requestTitles = [...requestPrimaryTitles, ...requestAliasTitles]
+        .filter((value, index, array) => value.length > 0 && array.indexOf(value) === index);
+
+      const titleContains = (haystack: string, needle: string) => {
+        if (!haystack || !needle) return false;
+        return (
+          haystack === needle ||
+          haystack.includes(needle) ||
+          needle.includes(haystack)
+        );
+      };
+
+      const titleMatches = (haystack: string, needle: string, minScore = 0.9) => {
+        if (!haystack || !needle) return false;
+        return titleContains(haystack, needle) || partial_ratio(haystack, needle) / 100 >= minScore;
+      };
+
+      const stripReleaseNoiseForTitle = (value: string) => {
+        let cleaned = value
+          .replace(/\.[a-z0-9]{2,5}$/i, ' ')
+          // Drop common release-group tags and technical bracket groups, but leave the actual title text.
+          .replace(/^\s*[\[(][^\])]+[\])]\s*/g, ' ')
+          .replace(/[\[(][^\])]*(?:1080p|720p|2160p|480p|x26[45]|h\.?26[45]|hevc|avc|web[- .]?dl|webrip|bluray|bdrip|dvdrip|aac|flac|opus|truehd|atmos|dual[ ._-]?audio|multi|proper|repack|v\d)[^\])]*[\])]/gi, ' ')
+          .replace(/[._-]+/g, ' ')
+          .replace(/\bS\d{1,2}\s*E\d{1,3}\b/gi, ' ')
+          .replace(/\b\d{1,2}\s*x\s*\d{1,3}\b/gi, ' ')
+          .replace(/\b(?:episode|ep)\s*\d{1,3}\b/gi, ' ')
+          .replace(/\b(?:part|pt)\s*\d{1,3}\b/gi, ' ')
+          .replace(/\b(?:vol(?:ume)?|season)\s*\d{1,3}\b/gi, ' ')
+          .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+          .replace(/\b(?:2160p|1080p|720p|576p|540p|480p|360p|uhd|hdr10?|dv|dolby|vision|bluray|blu ray|bdrip|web dl|webrip|hdtv|x26[45]|h 26[45]|hevc|avc|aac|flac|opus|truehd|atmos|dts|dual audio|dubbed|subbed|multi|gb|jp|jpn|eng|es|fr|pt|mkv|mp4|avi)\b/gi, ' ')
+          .replace(/\b\d+(?:\.\d+)?\s*(?:gb|mb|kb)\b/gi, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        return normaliseTitle(cleaned);
+      };
+
+      const rawFilenameText = [stream.filename, stream.folderName, stream.originalName]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .join(' ');
+      const rawIdentityText = [rawFilenameText, stream.parsedFile?.title]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .join(' ');
+      const normalisedRawFilename = normaliseTitle(rawFilenameText || primaryCandidateText);
+      const normalisedRawIdentity = normaliseTitle(rawIdentityText || primaryCandidateText);
+      const rawReleaseTitle = stripReleaseNoiseForTitle(rawIdentityText || primaryCandidateText);
+      const rawFilenameReleaseTitle = stripReleaseNoiseForTitle(rawFilenameText || primaryCandidateText);
+      const rawReleaseTitleWords = rawReleaseTitle.split(/\s+/).filter(Boolean);
+      const rawFilenameReleaseTitleWords = rawFilenameReleaseTitle.split(/\s+/).filter(Boolean);
+
+      const hasRequestedSeriesTitle = requestTitles.some(
+        (title) =>
+          titleMatches(normalisedPrimaryCandidate, title, 0.9) ||
+          titleMatches(normalisedRawIdentity, title, 0.9) ||
+          titleMatches(rawReleaseTitle, title, 0.9)
+      );
+
+      const hasRequestedPrimarySeriesTitleInFilename = requestPrimaryTitles.some(
+        (title) =>
+          titleMatches(normalisedRawFilename, title, 0.9) ||
+          titleMatches(rawFilenameReleaseTitle, title, 0.9)
+      );
+
+      const hasRequestedEpisodeTitle =
+        titleMatches(normalisedPrimaryCandidate, normalisedRequestedEpisodeTitle, threshold) ||
+        titleMatches(normalisedRawIdentity, normalisedRequestedEpisodeTitle, threshold) ||
+        titleMatches(rawReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
+
+      const hasRequestedEpisodeTitleInFilename =
+        titleMatches(normalisedRawFilename, normalisedRequestedEpisodeTitle, threshold) ||
+        titleMatches(rawFilenameReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
+
+      if (hasRequestedEpisodeTitle) {
         return true;
       }
 
@@ -1144,11 +1242,12 @@ class StreamFilterer {
           ) {
             return false;
           }
-          const otherScore =
-            partial_ratio(
-              normalisedCandidate,
-              normaliseTitle(episodeInfo.title)
-            ) / 100;
+          const otherTitle = normaliseTitle(episodeInfo.title);
+          const otherScore = Math.max(
+            partial_ratio(normalisedCandidate, otherTitle) / 100,
+            partial_ratio(normalisedPrimaryCandidate, otherTitle) / 100,
+            partial_ratio(rawReleaseTitle, otherTitle) / 100
+          );
           return otherScore >= threshold;
         }
       );
@@ -1161,32 +1260,85 @@ class StreamFilterer {
         return false;
       }
 
-      const requestTitles = [
-        requestedMetadata?.title,
-        ...(requestedMetadata?.titles?.map((title) => title.title) ?? []),
-      ]
-        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-        .map((value) => normaliseTitle(value));
+      const explicitEpisodeMarkerPatterns = [
+        new RegExp(`\\bS0?${requestedSeason}\\s*E0?${requestedEpisode}\\b`, 'i'),
+        new RegExp(`\\b0?${requestedSeason}\\s*x\\s*0?${requestedEpisode}\\b`, 'i'),
+        new RegExp(`\\bseason\\s*0?${requestedSeason}\\s*(?:episode|ep)\\s*0?${requestedEpisode}\\b`, 'i'),
+        new RegExp(`\\b(?:episode|ep)\\s*0?${requestedEpisode}\\b`, 'i'),
+      ];
 
-      const hasRequestedSeriesTitle = requestTitles.some(
-        (title) => partial_ratio(normalisedCandidate, title) / 100 >= 0.9
+      const hasExplicitRequestedEpisodeMarker = explicitEpisodeMarkerPatterns.some((pattern) =>
+        pattern.test(rawIdentityText)
       );
 
-      const hasAnimeExtraSignal =
-        /\b(ova|oad|ona|omake|specials?|recaps?|bonus|extras?|spin[ ._-]?off|chibi)\b/i.test(
-          candidateText
-        );
+      const extraSignalPattern =
+        /\b(ova|oad|ona|omake|specials?|recaps?|bonus|extras?|spin[ ._-]?off|chibi|movie|film|the[ ._-]?movie|pilot|trailer|teaser|pv|cm)\b/i;
 
-      if (
-        episodeTitleMatchingOptions.mode === 'mismatchOnly' &&
-        hasAnimeExtraSignal &&
-        !hasRequestedSeriesTitle
-      ) {
-        this.incrementRemovalReason(
-          'episodeTitleMatching',
-          `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} looks like a different extra/special and did not match requested episode title: ${requestedEpisodeTitle}`
-        );
-        return false;
+      const hasAnimeExtraSignal = extraSignalPattern.test(rawIdentityText);
+      const hasFilenameAnimeExtraSignal = extraSignalPattern.test(rawFilenameText || rawIdentityText);
+
+      const releaseTitleLooksMeaningful =
+        rawReleaseTitleWords.length >= 2 &&
+        !rawReleaseTitleWords.every((word) => /^\d+$/.test(word));
+
+      const filenameReleaseTitleLooksMeaningful =
+        rawFilenameReleaseTitleWords.length >= 2 &&
+        !rawFilenameReleaseTitleWords.every((word) => /^\d+$/.test(word));
+
+      const releaseTitleHasExtraWordsBeyondRequestedTitle = requestTitles.some((title) => {
+        if (!titleContains(rawReleaseTitle, title)) return false;
+        const remaining = rawReleaseTitle
+          .replace(new RegExp(`\\b${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), ' ')
+          .split(/\s+/)
+          .filter((word) => word.length > 2 && !/^\d+$/.test(word));
+        return remaining.length >= 2;
+      });
+
+      if (episodeTitleMatchingOptions.mode === 'mismatchOnly') {
+        // v2: reject generic spin-off / OVA / movie / different-title false positives.
+        // This is intentionally based on the raw filename/folder/parsed title only, not on
+        // display description/message text, because addon descriptions may include the requested title.
+        if (
+          isAnime &&
+          hasFilenameAnimeExtraSignal &&
+          !hasRequestedEpisodeTitleInFilename &&
+          !hasRequestedPrimarySeriesTitleInFilename
+        ) {
+          this.incrementRemovalReason(
+            'episodeTitleMatching',
+            `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} filename looks like a different OVA/special/movie title for the requested episode: ${requestedEpisodeTitle}`
+          );
+          return false;
+        }
+
+        if (
+          hasAnimeExtraSignal &&
+          !hasRequestedEpisodeTitle &&
+          (!hasRequestedSeriesTitle || (!hasExplicitRequestedEpisodeMarker && releaseTitleHasExtraWordsBeyondRequestedTitle))
+        ) {
+          this.incrementRemovalReason(
+            'episodeTitleMatching',
+            `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} looks like a different extra/special/movie title for the requested episode: ${requestedEpisodeTitle}`
+          );
+          return false;
+        }
+
+        if (
+          !hasExplicitRequestedEpisodeMarker &&
+          (releaseTitleLooksMeaningful || filenameReleaseTitleLooksMeaningful) &&
+          !hasRequestedSeriesTitle &&
+          !hasRequestedEpisodeTitle
+        ) {
+          this.incrementRemovalReason(
+            'episodeTitleMatching',
+            `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} looks like a different title for the requested episode: ${requestedEpisodeTitle}`
+          );
+          return false;
+        }
+      }
+
+      if (!episodeTitleMatchingOptions.strict && avoidStrictEpisodeTitleRequirement) {
+        return true;
       }
 
       if (
