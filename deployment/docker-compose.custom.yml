@@ -1,0 +1,14 @@
+services:
+  aiostreams:
+    image: ghcr.io/YOUR_GITHUB_USERNAME/aiostreams:episode-title-matching
+    container_name: aiostreams
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - BASE_URL=https://aiostreams.yourdomain.com
+      - SECRET_KEY=change-this-to-a-long-random-string
+      # Optional if you want custom regex access on self-host:
+      # - TRUSTED_UUIDS=your-aiostreams-user-uuid
+    volumes:
+      - ./data:/app/data
