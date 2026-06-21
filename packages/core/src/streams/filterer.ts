@@ -1251,16 +1251,23 @@ class StreamFilterer {
         return normaliseTitle(cleaned);
       };
 
+      const filenameOnlyText = typeof stream.filename === 'string' ? stream.filename : '';
+      const filenameAndParsedTitleText = [stream.filename, stream.parsedFile?.title]
+        .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        .join(' ');
       const rawFilenameText = [stream.filename, stream.folderName, stream.originalName]
         .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
         .join(' ');
       const rawIdentityText = [rawFilenameText, stream.parsedFile?.title]
         .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
         .join(' ');
+      const normalisedFilenameOnly = normaliseTitle(filenameOnlyText || stream.parsedFile?.title || '');
+      const normalisedFilenameAndParsedTitle = normaliseTitle(filenameAndParsedTitleText || primaryCandidateText);
       const normalisedRawFilename = normaliseTitle(rawFilenameText || primaryCandidateText);
       const normalisedRawIdentity = normaliseTitle(rawIdentityText || primaryCandidateText);
       const rawReleaseTitle = stripReleaseNoiseForTitle(rawIdentityText || primaryCandidateText);
       const rawFilenameReleaseTitle = stripReleaseNoiseForTitle(rawFilenameText || primaryCandidateText);
+      const filenameOnlyReleaseTitle = stripReleaseNoiseForTitle(filenameOnlyText || stream.parsedFile?.title || '');
       const rawReleaseTitleWords = rawReleaseTitle.split(/\s+/).filter(Boolean);
       const rawFilenameReleaseTitleWords = rawFilenameReleaseTitle.split(/\s+/).filter(Boolean);
 
@@ -1277,6 +1284,13 @@ class StreamFilterer {
           titleMatches(rawFilenameReleaseTitle, title, 0.9)
       );
 
+      const hasRequestedPrimarySeriesTitleInFilenameOnly = requestPrimaryTitles.some(
+        (title) =>
+          titleMatches(normalisedFilenameOnly, title, 0.9) ||
+          titleMatches(normalisedFilenameAndParsedTitle, title, 0.9) ||
+          titleMatches(filenameOnlyReleaseTitle, title, 0.9)
+      );
+
       const hasRequestedEpisodeTitle =
         titleMatches(normalisedPrimaryCandidate, normalisedRequestedEpisodeTitle, threshold) ||
         titleMatches(normalisedRawIdentity, normalisedRequestedEpisodeTitle, threshold) ||
@@ -1285,6 +1299,11 @@ class StreamFilterer {
       const hasRequestedEpisodeTitleInFilename =
         titleMatches(normalisedRawFilename, normalisedRequestedEpisodeTitle, threshold) ||
         titleMatches(rawFilenameReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
+
+      const hasRequestedEpisodeTitleInFilenameOnly =
+        titleMatches(normalisedFilenameOnly, normalisedRequestedEpisodeTitle, threshold) ||
+        titleMatches(normalisedFilenameAndParsedTitle, normalisedRequestedEpisodeTitle, threshold) ||
+        titleMatches(filenameOnlyReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
 
       // Do not return early on hasRequestedEpisodeTitle here.
       // The formatted/display text can contain the requested episode title even when
@@ -1334,30 +1353,39 @@ class StreamFilterer {
 
       const hasAnimeExtraSignal = extraSignalPattern.test(rawIdentityText);
       const hasFilenameAnimeExtraSignal = extraSignalPattern.test(rawFilenameText || rawIdentityText);
+      const hasFilenameOnlyAnimeExtraSignal = extraSignalPattern.test(filenameOnlyText || stream.parsedFile?.title || '');
 
       logEpisodeTitleDebug('Episode title matching computed fields', {
         filename: stream.filename,
         folderName: stream.folderName,
         originalName: stream.originalName,
         parsedTitle: stream.parsedFile?.title,
+        filenameOnlyText,
+        filenameAndParsedTitleText,
         rawFilenameText,
         rawIdentityText,
         primaryCandidateText,
         normalisedCandidate,
         normalisedPrimaryCandidate,
+        normalisedFilenameOnly,
+        normalisedFilenameAndParsedTitle,
         normalisedRawFilename,
         normalisedRawIdentity,
         rawReleaseTitle,
         rawFilenameReleaseTitle,
+        filenameOnlyReleaseTitle,
         requestTitles,
         requestPrimaryTitles,
         normalisedRequestedEpisodeTitle,
         hasRequestedSeriesTitle,
         hasRequestedPrimarySeriesTitleInFilename,
+        hasRequestedPrimarySeriesTitleInFilenameOnly,
         hasRequestedEpisodeTitle,
         hasRequestedEpisodeTitleInFilename,
+        hasRequestedEpisodeTitleInFilenameOnly,
         hasAnimeExtraSignal,
         hasFilenameAnimeExtraSignal,
+        hasFilenameOnlyAnimeExtraSignal,
       });
 
       const releaseTitleLooksMeaningful =
@@ -1378,6 +1406,23 @@ class StreamFilterer {
       });
 
       if (episodeTitleMatchingOptions.mode === 'mismatchOnly') {
+        // v9: make the OVA/special check use the actual file name only.
+        // Torrent/debrid results can come from a season/franchise folder named "Overlord",
+        // while the file itself is a spin-off like "Ple Ple Pleiades OVA...". The older
+        // check looked at filename+folder together, so the folder title caused a false pass.
+        if (
+          isAnime &&
+          hasFilenameOnlyAnimeExtraSignal &&
+          !hasRequestedEpisodeTitleInFilenameOnly &&
+          !hasRequestedPrimarySeriesTitleInFilenameOnly
+        ) {
+          this.incrementRemovalReason(
+            'episodeTitleMatching',
+            `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} filename-only looks like a different OVA/special/movie title for the requested episode: ${requestedEpisodeTitle}`
+          );
+          return false;
+        }
+
         // v2: reject generic spin-off / OVA / movie / different-title false positives.
         // This is intentionally based on the raw filename/folder/parsed title only, not on
         // display description/message text, because addon descriptions may include the requested title.

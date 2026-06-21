@@ -112,3 +112,17 @@ Recommended settings remain:
 ## V8 - Episode title debug logging
 
 Adds opt-in debug logging with `EPISODE_TITLE_DEBUG=true` to print the exact stream fields and episode-title matching decisions. This is intended to diagnose cases where a visible stream title/episode does not match the raw filename fields used by the filter, or where an addon sets passthrough behaviour before episode-title matching runs.
+
+
+## V9 - Filename-only OVA/special rejection
+
+The v8 debug logs showed the bad `Ple Ple Pleiades OVA...` stream was allowed by the non-strict pack passthrough because the stream came from an `Overlord` batch folder. The older checks treated `filename + folderName` as the filename signal, so the folder title made `hasRequestedPrimarySeriesTitleInFilename` true.
+
+V9 adds filename-only checks before the pack passthrough:
+
+- If the actual filename contains OVA/OAD/ONA/special/movie/spin-off style terms,
+- and the actual filename does not contain the requested primary series title,
+- and the actual filename does not contain the requested episode title,
+- reject it in Mismatch Only mode.
+
+This should reject `Ple Ple Pleiades OVA Clementine The Fugitive Part 3.mkv` for normal `Overlord S1E3`, while still allowing normal files like `Overlord - S01E03.mkv` from season-pack folders.
