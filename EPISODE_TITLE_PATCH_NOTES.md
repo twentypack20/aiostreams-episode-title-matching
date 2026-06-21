@@ -146,3 +146,10 @@ v11 adds a conservative anime-only guard when `English` is required and the orig
 - Record the removal under `Required Language` as `English audio not confirmed; likely subtitle-only language tag`.
 
 Keep Japanese excluded languages unset. Do not globally exclude Japanese, because good dual-audio releases usually include Japanese plus English.
+
+
+## V12 - English-original unknown language fallback
+
+V11 correctly rejects likely subtitle-only English tags for non-English anime when English audio is required, but normal English-original shows/movies can have sparse filename metadata where parsed language is `Unknown` or `Multi` despite the metadata original language being English.
+
+V12 allows `Unknown`, `Multi`, or `Original` language metadata to satisfy required English only when the requested content metadata says the original language is English. Explicit non-English parsed languages such as Russian or Italian are still rejected when English is required.

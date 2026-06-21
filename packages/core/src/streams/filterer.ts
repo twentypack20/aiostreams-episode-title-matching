@@ -1828,6 +1828,33 @@ class StreamFilterer {
       return !hasStrongEnglishAudioSignal(stream);
     };
 
+    const shouldAllowUnknownEnglishOriginalStream = (
+      stream: ParsedStream
+    ): boolean => {
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (!originalLanguage || originalLanguage !== 'English') {
+        return false;
+      }
+
+      const languages = stream.parsedFile?.languages?.length
+        ? stream.parsedFile.languages
+        : ['Unknown'];
+
+      if (languages.includes('English' as any)) {
+        return true;
+      }
+
+      // Many older English-language TV/movie releases do not carry a language
+      // marker in the filename, so parser output becomes Unknown or Multi even
+      // though the content metadata itself says the original language is English.
+      // Allow only vague language values here; still reject explicit non-English
+      // languages such as Russian/Italian when English is required.
+      const allowedVagueLanguages = new Set(['Unknown', 'Multi', 'Original']);
+      return languages.every((lang) => allowedVagueLanguages.has(lang));
+    };
+
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
 
@@ -2324,13 +2351,27 @@ class StreamFilterer {
         this.userData.requiredLanguages.length > 0 &&
         !this.userData.requiredLanguages.some((lang) =>
           (file?.languages.length ? file.languages : ['Unknown']).includes(lang)
-        )
+        ) &&
+        !shouldAllowUnknownEnglishOriginalStream(stream)
       ) {
         this.incrementRemovalReason(
           'requiredLanguage',
           file?.languages.length ? file.languages.join(', ') : 'Unknown'
         );
         return false;
+      }
+
+      if (
+        !skipLanguageFiltering &&
+        shouldAllowUnknownEnglishOriginalStream(stream)
+      ) {
+        logEpisodeTitleDebug('Language filter allowed English-original stream with vague language metadata', {
+          filename: stream.filename,
+          folderName: stream.folderName,
+          originalName: stream.originalName,
+          parsedLanguages: file?.languages,
+          originalLanguage,
+        });
       }
 
       if (
