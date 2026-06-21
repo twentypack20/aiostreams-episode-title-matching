@@ -126,3 +126,10 @@ V9 adds filename-only checks before the pack passthrough:
 - reject it in Mismatch Only mode.
 
 This should reject `Ple Ple Pleiades OVA Clementine The Fugitive Part 3.mkv` for normal `Overlord S1E3`, while still allowing normal files like `Overlord - S01E03.mkv` from season-pack folders.
+
+
+## V10 - Actual filename-only OVA rejection
+
+V9 still let some spin-off files through because `hasRequestedPrimarySeriesTitleInFilenameOnly` included `parsedTitle`, and the parser could infer `Overlord` from the surrounding folder/batch even when the literal filename was `Ple Ple Pleiades OVA...`.
+
+V10 adds stricter actual-filename-only checks that use only the literal filename and the release title extracted from that filename. The OVA/special/movie rejection now uses those stricter checks before non-strict pack passthrough.

@@ -1291,6 +1291,16 @@ class StreamFilterer {
           titleMatches(filenameOnlyReleaseTitle, title, 0.9)
       );
 
+      // v10: actual file-name only means the literal file name and the release title
+      // extracted from that file name. Do not include parsedTitle here, because parsers
+      // can infer the requested series title from the surrounding folder/metadata even
+      // when the real file is a spin-off/OVA inside a franchise batch.
+      const hasRequestedPrimarySeriesTitleInActualFilenameOnly = requestPrimaryTitles.some(
+        (title) =>
+          titleMatches(normalisedFilenameOnly, title, 0.9) ||
+          titleMatches(filenameOnlyReleaseTitle, title, 0.9)
+      );
+
       const hasRequestedEpisodeTitle =
         titleMatches(normalisedPrimaryCandidate, normalisedRequestedEpisodeTitle, threshold) ||
         titleMatches(normalisedRawIdentity, normalisedRequestedEpisodeTitle, threshold) ||
@@ -1303,6 +1313,10 @@ class StreamFilterer {
       const hasRequestedEpisodeTitleInFilenameOnly =
         titleMatches(normalisedFilenameOnly, normalisedRequestedEpisodeTitle, threshold) ||
         titleMatches(normalisedFilenameAndParsedTitle, normalisedRequestedEpisodeTitle, threshold) ||
+        titleMatches(filenameOnlyReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
+
+      const hasRequestedEpisodeTitleInActualFilenameOnly =
+        titleMatches(normalisedFilenameOnly, normalisedRequestedEpisodeTitle, threshold) ||
         titleMatches(filenameOnlyReleaseTitle, normalisedRequestedEpisodeTitle, threshold);
 
       // Do not return early on hasRequestedEpisodeTitle here.
@@ -1380,9 +1394,11 @@ class StreamFilterer {
         hasRequestedSeriesTitle,
         hasRequestedPrimarySeriesTitleInFilename,
         hasRequestedPrimarySeriesTitleInFilenameOnly,
+        hasRequestedPrimarySeriesTitleInActualFilenameOnly,
         hasRequestedEpisodeTitle,
         hasRequestedEpisodeTitleInFilename,
         hasRequestedEpisodeTitleInFilenameOnly,
+        hasRequestedEpisodeTitleInActualFilenameOnly,
         hasAnimeExtraSignal,
         hasFilenameAnimeExtraSignal,
         hasFilenameOnlyAnimeExtraSignal,
@@ -1406,19 +1422,19 @@ class StreamFilterer {
       });
 
       if (episodeTitleMatchingOptions.mode === 'mismatchOnly') {
-        // v9: make the OVA/special check use the actual file name only.
+        // v10: make the OVA/special check use literal filename-only matches.
         // Torrent/debrid results can come from a season/franchise folder named "Overlord",
         // while the file itself is a spin-off like "Ple Ple Pleiades OVA...". The older
         // check looked at filename+folder together, so the folder title caused a false pass.
         if (
           isAnime &&
           hasFilenameOnlyAnimeExtraSignal &&
-          !hasRequestedEpisodeTitleInFilenameOnly &&
-          !hasRequestedPrimarySeriesTitleInFilenameOnly
+          !hasRequestedEpisodeTitleInActualFilenameOnly &&
+          !hasRequestedPrimarySeriesTitleInActualFilenameOnly
         ) {
           this.incrementRemovalReason(
             'episodeTitleMatching',
-            `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} filename-only looks like a different OVA/special/movie title for the requested episode: ${requestedEpisodeTitle}`
+            `${stream.filename || stream.parsedFile?.title || 'Unknown stream'} actual filename-only looks like a different OVA/special/movie title for the requested episode: ${requestedEpisodeTitle}`
           );
           return false;
         }
