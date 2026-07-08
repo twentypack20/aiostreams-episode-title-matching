@@ -2784,3 +2784,8 @@ See the commit breakdown below:
 
 - pass `baseUrl` in Easynews++ config and add optional `EASYNEWS_PLUS_PLUS_PUBLIC_URL`. ([b41e210](https://github.com/Viren070/AIOStreams/commit/b41e210c04777b349629dc98f28982bfb2e54886))
 - stremthru improvements ([#172](https://github.com/Viren070/AIOStreams/issues/172)) ([72b5ab6](https://github.com/Viren070/AIOStreams/commit/72b5ab648e511220d7ff8b4bf453db94bb952b30))
+
+### Custom v15 - Foreign-original Unknown language fallback
+
+- Added a narrow fallback for non-English-original content where cached provider results have only `Unknown` language metadata and English-required filtering would otherwise remove every playable option.
+- This is intended to make `Unknown` behave as a last-resort option beneath English/Dual Audio/Dubbed results, without globally allowing `Unknown` for normal content.

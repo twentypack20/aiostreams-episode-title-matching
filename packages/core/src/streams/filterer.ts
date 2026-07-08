@@ -2005,6 +2005,30 @@ class StreamFilterer {
       return languages.every((lang) => lang === 'Unknown');
     };
 
+    const shouldAllowForeignOriginalUnknownLanguageFallbackStream = (
+      stream: ParsedStream
+    ): boolean => {
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (!originalLanguage || originalLanguage === 'English') {
+        return false;
+      }
+
+      const languages = stream.parsedFile?.languages?.length
+        ? stream.parsedFile.languages
+        : ['Unknown'];
+
+      // v15: fallback for foreign-original shows/movies with no confirmed English
+      // links. If the provider exposes no useful language metadata at all, allow
+      // Unknown so the user still gets a last-resort playable option. This is
+      // deliberately narrower than adding Unknown to Required Languages globally:
+      // explicit non-English language tags are still blocked, subtitle-only
+      // English anime streams are still rejected below, and normal English-original
+      // content continues to use the v12 English-original fallback.
+      return languages.every((lang) => lang === 'Unknown');
+    };
+
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
 
@@ -2504,7 +2528,8 @@ class StreamFilterer {
         ) &&
         !shouldAllowUnknownEnglishOriginalStream(stream) &&
         !shouldAllowAnimeLikelyEnglishAudioAliasStream(stream) &&
-        !shouldAllowAnimeSpecialUnknownLanguageFallbackStream(stream)
+        !shouldAllowAnimeSpecialUnknownLanguageFallbackStream(stream) &&
+        !shouldAllowForeignOriginalUnknownLanguageFallbackStream(stream)
       ) {
         this.incrementRemovalReason(
           'requiredLanguage',
@@ -2550,6 +2575,20 @@ class StreamFilterer {
           parsedTitle: stream.parsedFile?.title,
           parsedLanguages: file?.languages,
           requestedEpisodeTitle,
+          originalLanguage,
+        });
+      }
+
+      if (
+        !skipLanguageFiltering &&
+        shouldAllowForeignOriginalUnknownLanguageFallbackStream(stream)
+      ) {
+        logEpisodeTitleDebug('Language filter allowed foreign-original Unknown-language fallback stream', {
+          filename: stream.filename,
+          folderName: stream.folderName,
+          originalName: stream.originalName,
+          parsedTitle: stream.parsedFile?.title,
+          parsedLanguages: file?.languages,
           originalLanguage,
         });
       }

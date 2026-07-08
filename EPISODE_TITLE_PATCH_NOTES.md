@@ -170,3 +170,22 @@ Recommended settings remain:
 - Episode Title Matching Request Types: anime
 - Season/Episode Matching: Enabled
 - Exclude Uncached: Enabled
+
+## v15 - Foreign-original Unknown language fallback
+
+Some non-English-original shows/movies have no English-tagged streams from the provider, and otherwise valid cached streams can parse as `Unknown`. With `Required Languages: English`, these were removed as `Required Language (Unknown)`, leaving no links.
+
+v15 adds a narrow fallback:
+
+- If the requested content's original language is known and is not English
+- And the user requires English
+- And the stream's parsed language metadata is only `Unknown`
+- Then allow the stream as a last-resort fallback
+
+This does **not** add `Unknown` globally and does not allow explicit non-English language tags. Preferred-language sorting should still rank English / Dual Audio / Dubbed streams above Unknown whenever those exist.
+
+Recommended sorting/config:
+
+- Required Languages: English, Dual Audio, Dubbed
+- Preferred Languages order: English, Dubbed, Dual Audio
+- Keep the language sort criterion enabled so `Unknown` falls below preferred known-language matches.
