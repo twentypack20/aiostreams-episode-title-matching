@@ -1807,8 +1807,6 @@ class StreamFilterer {
       const file = stream.parsedFile;
       const languages = file?.languages ?? [];
       const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
-      const originalLanguageLower = originalLanguage?.toLowerCase();
-
       if (languageSet.has('dual audio') || languageSet.has('dubbed')) {
         return true;
       }
@@ -1817,14 +1815,10 @@ class StreamFilterer {
         return true;
       }
 
-      if (
-        originalLanguageLower &&
-        originalLanguageLower !== 'english' &&
-        languageSet.has(originalLanguageLower) &&
-        languageSet.has('english')
-      ) {
-        return true;
-      }
+      // Do not treat "original language + English" as a strong English-audio signal
+      // by itself. Many anime/foreign releases parse subtitle language tags such as
+      // "JPN SUB ENG" into languages=["Japanese", "English"], which is not proof of
+      // English audio. Require an explicit dual-audio/dub marker instead.
 
       const haystack = normaliseLooseText(
         [
@@ -1843,18 +1837,50 @@ class StreamFilterer {
       );
     };
 
+    const hasSubtitleLanguageEvidence = (stream: ParsedStream): boolean => {
+      const file = stream.parsedFile;
+      if (file?.subtitles?.some((lang) => lang === 'English')) {
+        return true;
+      }
+
+      const haystack = normaliseLooseText(
+        [
+          stream.filename,
+          stream.folderName,
+          stream.originalName,
+          file?.title,
+          file?.releaseGroup,
+        ]
+          .filter(Boolean)
+          .join(' ')
+      );
+
+      return /\b(multi subs?|multi subtitles?|subs?|subtitles?|subtitle|softsubs?|hardsubs?)\b/.test(
+        haystack
+      );
+    };
+
     const shouldRejectLikelySubtitleOnlyEnglishAnime = (
       stream: ParsedStream
     ): boolean => {
       const file = stream.parsedFile;
       const languages = file?.languages?.length ? file.languages : ['Unknown'];
 
-      if (!isAnime) return false;
       if (!this.userData.requiredLanguages?.includes('English' as any)) {
         return false;
       }
       if (!originalLanguage || originalLanguage === 'English') return false;
       if (!languages.includes('English' as any)) return false;
+
+      // For confirmed anime, be strict: plain "English" is often just an
+      // English subtitle tag unless we see an explicit dub/dual-audio signal.
+      // For non-English-original items that were not detected as anime, only apply
+      // this stricter rule when there is clear subtitle evidence in the filename or
+      // parsed subtitle fields. This catches anime that arrives as requestType=series
+      // without making every foreign live-action title overly strict.
+      if (!isAnime && !hasSubtitleLanguageEvidence(stream)) {
+        return false;
+      }
 
       return !hasStrongEnglishAudioSignal(stream);
     };

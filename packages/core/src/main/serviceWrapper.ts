@@ -24,6 +24,107 @@ import { PresetManager } from '../presets/presetManager.js';
 
 const logger = createLogger('serviceWrapper');
 
+const SUBTITLE_LANGUAGE_SECTION_RE =
+  /(?:^|[\s._\-[\]()])(?:multi[\s._-]?subs?|multi[\s._-]?subtitles?|subs?|subtitles?|subtitle|softsubs?|hardsubs?|forced)(?=$|[\s._\-[\]():])/i;
+
+const SUBTITLE_LANGUAGE_ALIASES: Record<string, string> = {
+  en: 'English',
+  eng: 'English',
+  english: 'English',
+  gb: 'English',
+  us: 'English',
+  ja: 'Japanese',
+  jp: 'Japanese',
+  jpn: 'Japanese',
+  japanese: 'Japanese',
+  zh: 'Chinese',
+  zho: 'Chinese',
+  chi: 'Chinese',
+  chs: 'Chinese',
+  cht: 'Chinese',
+  cn: 'Chinese',
+  chinese: 'Chinese',
+  id: 'Indonesian',
+  ind: 'Indonesian',
+  indonesian: 'Indonesian',
+  th: 'Thai',
+  tha: 'Thai',
+  thai: 'Thai',
+  es: 'Spanish',
+  spa: 'Spanish',
+  spanish: 'Spanish',
+  fr: 'French',
+  fra: 'French',
+  fre: 'French',
+  french: 'French',
+  de: 'German',
+  ger: 'German',
+  deu: 'German',
+  german: 'German',
+  it: 'Italian',
+  ita: 'Italian',
+  italian: 'Italian',
+  pt: 'Portuguese',
+  por: 'Portuguese',
+  portuguese: 'Portuguese',
+  ko: 'Korean',
+  kor: 'Korean',
+  korean: 'Korean',
+  ru: 'Russian',
+  rus: 'Russian',
+  russian: 'Russian',
+};
+
+function extractSubtitleLanguagesFromMarkedText(text?: string): string[] {
+  if (!text) return [];
+
+  const marker = text.match(SUBTITLE_LANGUAGE_SECTION_RE);
+  if (!marker || marker.index === undefined) return [];
+
+  const segment = text.slice(marker.index + marker[0].length);
+  const tokens = segment
+    .split(/[^a-zA-Z0-9]+/)
+    .map((token) => token.toLowerCase())
+    .filter(Boolean);
+
+  const languages: string[] = [];
+  for (const token of tokens) {
+    const language = SUBTITLE_LANGUAGE_ALIASES[token];
+    if (language && !languages.includes(language)) {
+      languages.push(language);
+    }
+  }
+
+  return languages;
+}
+
+function stripSubtitleLanguagesFromAudioLanguages<
+  T extends { languages?: string[]; subtitles?: string[] },
+>(parsedMediaInfo: T | undefined, ...texts: (string | undefined)[]): T | undefined {
+  if (!parsedMediaInfo) return parsedMediaInfo;
+
+  const subtitleLanguages = Array.from(
+    new Set(texts.flatMap((text) => extractSubtitleLanguagesFromMarkedText(text)))
+  );
+
+  if (subtitleLanguages.length === 0) {
+    return parsedMediaInfo;
+  }
+
+  const subtitleLanguageSet = new Set(subtitleLanguages);
+  return {
+    ...parsedMediaInfo,
+    languages: parsedMediaInfo.languages?.filter(
+      (language) => !subtitleLanguageSet.has(language)
+    ),
+    subtitles: Array.from(
+      new Set([...(parsedMediaInfo.subtitles ?? []), ...subtitleLanguages])
+    ),
+  };
+}
+
+
+
 export interface ServiceWrapResult {
   streams: ParsedStream[];
   errors: ServiceWrapError[];
@@ -493,9 +594,13 @@ async function buildDebridStreams(
         },
       };
 
-      const parsedMediaInfo = mergeParsedMediaInfos(
-        original?.parsedFile,
-        result.parsedMediaInfo
+      const parsedMediaInfo = stripSubtitleLanguagesFromAudioLanguages(
+        mergeParsedMediaInfos(original?.parsedFile, result.parsedMediaInfo),
+        result.file.name,
+        result.title,
+        original?.filename,
+        original?.folderName,
+        original?.originalName
       );
       if (result.parsedMediaInfo && parsedMediaInfo) {
         debridStream.parsedFile = {
