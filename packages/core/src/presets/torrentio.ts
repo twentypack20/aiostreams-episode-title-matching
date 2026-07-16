@@ -24,8 +24,12 @@ export class TorrentioParser extends StreamParser {
     return lines[lines.length - 1] || '';
   }
 
+  private getMultiSubsMarkerMatch(stream: Stream): RegExpMatchArray | null {
+    return this.getLastDescriptionLine(stream).match(/\bmulti[\s._-]?subs?\b/i);
+  }
+
   private hasMultiSubsMarker(stream: Stream): boolean {
-    return this.getLastDescriptionLine(stream).includes('Multi Subs');
+    return !!this.getMultiSubsMarkerMatch(stream);
   }
 
   private getMultiSubsSubtitleLanguages(
@@ -37,12 +41,12 @@ export class TorrentioParser extends StreamParser {
     }
 
     const lastLine = this.getLastDescriptionLine(stream);
-    const markerIndex = lastLine.indexOf('Multi Subs');
-    if (markerIndex === -1) {
+    const marker = this.getMultiSubsMarkerMatch(stream);
+    if (!marker || marker.index === undefined) {
       return [];
     }
 
-    const segment = lastLine.slice(markerIndex);
+    const segment = lastLine.slice(marker.index);
     const subtitleLanguages = super.getLanguages(
       {
         ...stream,
