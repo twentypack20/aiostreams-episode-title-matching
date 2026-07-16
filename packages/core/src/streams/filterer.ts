@@ -351,6 +351,8 @@ class StreamFilterer {
   ): Promise<ParsedStream[]> {
     const { type, id, parsedId, isAnime } = context;
     const episodeTitleDebug = process.env.EPISODE_TITLE_DEBUG === 'true';
+    const allowForeignOriginalUnknownLanguageFallback =
+      process.env.ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK === 'true';
 
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
@@ -2034,6 +2036,9 @@ class StreamFilterer {
     const shouldAllowForeignOriginalUnknownLanguageFallbackStream = (
       stream: ParsedStream
     ): boolean => {
+      if (!allowForeignOriginalUnknownLanguageFallback) {
+        return false;
+      }
       if (!this.userData.requiredLanguages?.includes('English' as any)) {
         return false;
       }
@@ -2045,13 +2050,10 @@ class StreamFilterer {
         ? stream.parsedFile.languages
         : ['Unknown'];
 
-      // v15: fallback for foreign-original shows/movies with no confirmed English
-      // links. If the provider exposes no useful language metadata at all, allow
-      // Unknown so the user still gets a last-resort playable option. This is
-      // deliberately narrower than adding Unknown to Required Languages globally:
-      // explicit non-English language tags are still blocked, subtitle-only
-      // English anime streams are still rejected below, and normal English-original
-      // content continues to use the v12 English-original fallback.
+      // Optional fallback for foreign-original shows/movies with no confirmed
+      // English links. Disabled by default because Unknown is not a real
+      // language signal; enable only for a multilingual/last-resort config with
+      // ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK=true.
       return languages.every((lang) => lang === 'Unknown');
     };
 
