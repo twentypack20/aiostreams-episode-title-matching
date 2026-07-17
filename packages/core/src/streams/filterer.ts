@@ -1867,22 +1867,41 @@ class StreamFilterer {
     ): boolean => {
       const file = stream.parsedFile;
       const languages = file?.languages?.length ? file.languages : ['Unknown'];
+      const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
 
       if (!this.userData.requiredLanguages?.includes('English' as any)) {
         return false;
       }
-      if (!originalLanguage || originalLanguage === 'English') return false;
       if (!languages.includes('English' as any)) return false;
 
-      // For confirmed anime, be strict: plain "English" is often just an
-      // English subtitle tag unless we see an explicit dub/dual-audio signal.
-      // For non-English-original items that were not detected as anime, only apply
-      // this stricter rule when there is clear subtitle evidence in the filename or
-      // parsed subtitle fields. This catches anime that arrives as requestType=series
-      // without making every foreign live-action title overly strict.
-      if (!isAnime && !hasSubtitleLanguageEvidence(stream)) {
-        return false;
+      const hasExplicitNonEnglishLanguage = languages.some((lang) => {
+        const lower = lang.toLowerCase();
+        return ![
+          'english',
+          'dual audio',
+          'dubbed',
+          'multi',
+          'unknown',
+          'original',
+        ].includes(lower);
+      });
+
+      // For anime, be strict even when TMDB/metadata does not provide a reliable
+      // originalLanguage value. A plain GB/JP or English/Japanese tag without
+      // Dual Audio/Dubbed is often English subtitles plus Japanese audio. Do not
+      // reject plain English-only anime releases unless there is subtitle evidence
+      // or another explicit non-English language tag.
+      if (isAnime) {
+        if (hasStrongEnglishAudioSignal(stream)) return false;
+        return hasExplicitNonEnglishLanguage || hasSubtitleLanguageEvidence(stream);
       }
+
+      // Non-anime foreign-original content is a little looser: only reject when the
+      // content metadata says it is not English-original and there is clear subtitle
+      // evidence. This avoids over-filtering live-action foreign shows that may have
+      // weak or missing audio tags.
+      if (!originalLanguage || originalLanguage === 'English') return false;
+      if (!hasSubtitleLanguageEvidence(stream)) return false;
 
       return !hasStrongEnglishAudioSignal(stream);
     };
