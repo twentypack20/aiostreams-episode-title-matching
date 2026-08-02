@@ -356,7 +356,17 @@ class StreamFilterer {
     const allowForeignOriginalUnknownLanguageFallback = boolEnv(
       process.env.ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK
     );
-    const disableTorboxForAnime = boolEnv(process.env.DISABLE_TORBOX_FOR_ANIME);
+    const legacyDisableTorboxForAnime = boolEnv(process.env.DISABLE_TORBOX_FOR_ANIME);
+    const torboxAnimeMode = (
+      process.env.TORBOX_ANIME_MODE ||
+      (legacyDisableTorboxForAnime ? 'block' : 'allow')
+    ).toLowerCase();
+    const preferAIOStreamsPlaybackForAnime = boolEnv(
+      process.env.PREFER_AIOSTREAMS_PLAYBACK_FOR_ANIME
+    );
+    const torrentioAnimeResolveMode = (
+      process.env.TORRENTIO_ANIME_RESOLVE_MODE || 'allow'
+    ).toLowerCase();
 
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
@@ -2053,16 +2063,199 @@ class StreamFilterer {
       return /\/resolve\/torbox\//.test(urlText) || /[?&]service=torbox\b/.test(urlText);
     };
 
+    const getStreamUrlText = (stream: ParsedStream): string =>
+      `${stream.url ?? ''} ${stream.externalUrl ?? ''}`.toLowerCase();
+
+    const isAIOStreamsDebridPlaybackStream = (stream: ParsedStream): boolean =>
+      /\/api\/v1\/debrid\/playback\//.test(getStreamUrlText(stream));
+
+    const isTorrentioResolveStream = (stream: ParsedStream): boolean => {
+      const urlText = getStreamUrlText(stream);
+      return /torrentio\.strem\.fun/.test(urlText) && /\/resolve\//.test(urlText);
+    };
+
+    const normaliseStreamIdentity = (value: string | undefined): string =>
+      (value ?? '')
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\.(mkv|mp4|avi|mov|wmv|m4v)$/i, '')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+
+    const getDuplicateKey = (stream: ParsedStream): string | undefined => {
+      const filenameKey = normaliseStreamIdentity(
+        stream.filename || stream.parsedFile?.title || stream.originalName
+      );
+      if (filenameKey.length >= 12) {
+        return `name:${filenameKey}`;
+      }
+
+      const hash = stream.torrent?.infoHash || stream.videoHash;
+      if (hash) {
+        return `hash:${hash.toLowerCase()}`;
+      }
+
+      return undefined;
+    };
+
+    const animePlaybackPreferenceScore = (stream: ParsedStream): number => {
+      let score = 0;
+
+      if (isAIOStreamsDebridPlaybackStream(stream)) score += 1000;
+      if (isTorrentioResolveStream(stream)) score -= 250;
+
+      if (stream.service?.id?.toLowerCase() === 'realdebrid') score += 80;
+      if (isTorboxStream(stream)) score -= 20;
+
+      const encode = stream.parsedFile?.encode?.toLowerCase();
+      const quality = stream.parsedFile?.quality?.toLowerCase();
+      const fileText = normaliseStreamIdentity(
+        `${stream.filename ?? ''} ${stream.parsedFile?.title ?? ''}`
+      );
+
+      if (quality?.includes('web')) score += 30;
+      if (quality?.includes('bluray remux')) score -= 20;
+      if (encode === 'avc') score += 10;
+      if (encode === 'hevc') score -= 5;
+      if (encode === 'av1') score -= 35;
+      if (/\b(yameii|toonshub)\b/.test(fileText)) score += 25;
+
+      return score;
+    };
+
+    const optimiseAnimePlaybackStreams = (streamsToOptimise: ParsedStream[]): ParsedStream[] => {
+      if (!isAnime) return streamsToOptimise;
+
+      let result = [...streamsToOptimise];
+
+      if (preferAIOStreamsPlaybackForAnime) {
+        const groups = new Map<string, ParsedStream[]>();
+        for (const stream of result) {
+          const key = getDuplicateKey(stream);
+          if (!key) continue;
+          const existing = groups.get(key) ?? [];
+          existing.push(stream);
+          groups.set(key, existing);
+        }
+
+        const removeDuplicateIds = new Set<string>();
+        for (const group of groups.values()) {
+          const hasAIOStreamsPlayback = group.some(isAIOStreamsDebridPlaybackStream);
+          if (!hasAIOStreamsPlayback) continue;
+
+          for (const stream of group) {
+            if (
+              isTorrentioResolveStream(stream) &&
+              !isAIOStreamsDebridPlaybackStream(stream) &&
+              !shouldPassthroughStage(stream, 'filter')
+            ) {
+              removeDuplicateIds.add(stream.id);
+            }
+          }
+        }
+
+        if (removeDuplicateIds.size > 0) {
+          for (const stream of result) {
+            if (removeDuplicateIds.has(stream.id)) {
+              this.incrementRemovalReason(
+                'excludedFilterCondition',
+                'Duplicate Torrentio resolver hidden; AIOStreams debrid playback preferred'
+              );
+            }
+          }
+          result = result.filter((stream) => !removeDuplicateIds.has(stream.id));
+        }
+
+        result.sort(
+          (a, b) =>
+            animePlaybackPreferenceScore(b) - animePlaybackPreferenceScore(a)
+        );
+      }
+
+      if (torrentioAnimeResolveMode === 'block') {
+        const kept: ParsedStream[] = [];
+        for (const stream of result) {
+          if (isTorrentioResolveStream(stream) && !shouldPassthroughStage(stream, 'filter')) {
+            this.incrementRemovalReason(
+              'excludedFilterCondition',
+              'Torrentio resolver blocked for anime'
+            );
+            continue;
+          }
+          kept.push(stream);
+        }
+        result = kept;
+      } else if (torrentioAnimeResolveMode === 'fallback') {
+        const nonTorrentioResolve = result.filter(
+          (stream) => !isTorrentioResolveStream(stream)
+        );
+        const torrentioResolve = result.filter(isTorrentioResolveStream);
+
+        if (nonTorrentioResolve.length > 0 && torrentioResolve.length > 0) {
+          for (const stream of torrentioResolve) {
+            if (!shouldPassthroughStage(stream, 'filter')) {
+              this.incrementRemovalReason(
+                'excludedFilterCondition',
+                'Torrentio resolver hidden for anime; AIOStreams/non-Torrentio playback available'
+              );
+            }
+          }
+          result = [
+            ...nonTorrentioResolve,
+            ...torrentioResolve.filter((stream) => shouldPassthroughStage(stream, 'filter')),
+          ];
+        }
+      } else if (torrentioAnimeResolveMode === 'demote') {
+        result = [
+          ...result.filter((stream) => !isTorrentioResolveStream(stream)),
+          ...result.filter((stream) => isTorrentioResolveStream(stream)),
+        ];
+      }
+
+      if (torboxAnimeMode === 'block') {
+        const kept: ParsedStream[] = [];
+        for (const stream of result) {
+          if (isTorboxStream(stream) && !shouldPassthroughStage(stream, 'filter')) {
+            this.incrementRemovalReason(
+              'excludedFilterCondition',
+              'TorBox blocked for anime'
+            );
+            continue;
+          }
+          kept.push(stream);
+        }
+        result = kept;
+      } else if (torboxAnimeMode === 'fallback') {
+        const nonTorbox = result.filter((stream) => !isTorboxStream(stream));
+        const torbox = result.filter((stream) => isTorboxStream(stream));
+
+        if (nonTorbox.length > 0 && torbox.length > 0) {
+          for (const stream of torbox) {
+            if (!shouldPassthroughStage(stream, 'filter')) {
+              this.incrementRemovalReason(
+                'excludedFilterCondition',
+                'TorBox hidden for anime; non-TorBox fallback available'
+              );
+            }
+          }
+          result = [
+            ...nonTorbox,
+            ...torbox.filter((stream) => shouldPassthroughStage(stream, 'filter')),
+          ];
+        }
+      } else if (torboxAnimeMode === 'demote') {
+        result = [
+          ...result.filter((stream) => !isTorboxStream(stream)),
+          ...result.filter((stream) => isTorboxStream(stream)),
+        ];
+      }
+
+      return result;
+    };
+
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
-
-      if (isAnime && disableTorboxForAnime && isTorboxStream(stream)) {
-        this.incrementRemovalReason(
-          'excludedFilterCondition',
-          'TorBox disabled for anime'
-        );
-        return false;
-      }
 
       const skipLanguageFiltering = shouldPassthroughStage(stream, 'language');
       const skipSubtitleFiltering = shouldPassthroughStage(stream, 'subtitle');
@@ -3154,10 +3347,12 @@ class StreamFilterer {
     const filteredStreams = filterableStreams.filter(shouldKeepStream);
     filterPassMs = Date.now() - filterPassStart;
 
-    const finalStreams = StreamUtils.mergeStreams([
+    let finalStreams = StreamUtils.mergeStreams([
       ...includedWithoutPassthrough,
       ...filteredStreams,
     ]);
+
+    finalStreams = optimiseAnimePlaybackStreams(finalStreams);
 
     const totalMs = Date.now() - start;
     this.filterTimings.totalMs += totalMs;
