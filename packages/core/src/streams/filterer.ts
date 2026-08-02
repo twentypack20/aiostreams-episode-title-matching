@@ -3390,10 +3390,10 @@ class StreamFilterer {
     return finalStreams;
   }
   /**
-   * Preflight the final anime playback list after sorting, limiting, stream
-   * expression filtering, and fallback insertion. This deliberately checks the
-   * exact HTTP(S) stream URLs that are about to be returned to Stremio, rather
-   * than only checking a provider-specific subset earlier in the pipeline.
+   * Validate final anime resolver URLs after sorting, limiting, stream
+   * expression filtering, and fallback insertion. Resolver redirects are
+   * inspected without following the final debrid/CDN media URL, so error-video
+   * redirects can be removed without downloading media from the server IP.
    */
   public async preflightPlaybackStreams(
     streams: ParsedStream[],
@@ -3588,14 +3588,88 @@ class StreamFilterer {
       contentType.includes('json') ||
       contentType.includes('problem+json');
 
+    const isResolverUrl = (url: string): boolean =>
+      /\/api\/v1\/debrid\/playback\/|\/resolve\//i.test(url);
+
+    const classifyRedirectTarget = (
+      sourceUrl: string,
+      location: string
+    ): PreflightResult | { nestedResolverUrl: string } | undefined => {
+      let target: URL;
+      try {
+        target = new URL(location, sourceUrl);
+      } catch {
+        return {
+          status: 'failed',
+          reason: 'Preflight failed: resolver returned an invalid redirect URL',
+        };
+      }
+
+      const path = target.pathname.toLowerCase();
+      const targetText = `${path}${target.search}`.toLowerCase();
+
+      // AIOStreams deliberately represents debrid errors as small playable MP4
+      // files. Following the redirect makes those error videos look like valid
+      // media, so inspect the redirect target before touching the media URL.
+      if (/\/(?:unavailable_for_legal_reasons)\.mp4(?:$|[/?#])/i.test(path)) {
+        return {
+          status: 'failed',
+          reason: 'Preflight failed: unavailable for legal reasons',
+        };
+      }
+
+      if (
+        /\/(?:download_failed|403|401|no_matching_file|payment_required|store_limit_exceeded|content_proxy_limit_reached)\.mp4(?:$|[/?#])/i.test(
+          path
+        )
+      ) {
+        return {
+          status: 'failed',
+          reason: `Preflight failed: resolver redirected to ${path.split('/').pop()}`,
+        };
+      }
+
+      if (/\/(?:downloading|429|500)\.mp4(?:$|[/?#])/i.test(path)) {
+        return {
+          status: 'inconclusive',
+          reason: `Preflight inconclusive: resolver redirected to ${path.split('/').pop()}`,
+        };
+      }
+
+      if (
+        /(?:unavailable[_-]for[_-]legal[_-]reasons|no[_-]matching[_-]file|download[_-]failed|payment[_-]required|store[_-]limit[_-]exceeded|content[_-]proxy[_-]limit[_-]reached)/i.test(
+          targetText
+        )
+      ) {
+        return {
+          status: 'failed',
+          reason: 'Preflight failed: resolver redirected to an error resource',
+        };
+      }
+
+      // Some resolver services chain through another resolver endpoint. Follow
+      // only resolver-to-resolver hops. Never follow the final media/CDN URL;
+      // downloading even one byte from the VPS can consume a temporary link or
+      // make a debrid provider see playback from the server IP instead of the
+      // Stremio client's IP.
+      if (isResolverUrl(target.toString())) {
+        return { nestedResolverUrl: target.toString() };
+      }
+
+      // A non-error redirect to a direct URL means the resolver successfully
+      // produced a playback target. This is the furthest a server-side check can
+      // safely validate without actually playing the user's stream.
+      return { status: 'passed' };
+    };
+
     const inspectUrl = async (
       url: string,
       redirectDepth: number = 0
     ): Promise<PreflightResult> => {
-      if (redirectDepth > 2) {
+      if (redirectDepth > 3) {
         return {
           status: 'failed',
-          reason: 'Preflight failed: resolver returned too many nested URLs',
+          reason: 'Preflight failed: resolver returned too many nested resolver URLs',
         };
       }
 
@@ -3603,15 +3677,18 @@ class StreamFilterer {
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
+        const resolverRoute = isResolverUrl(url);
         const response = await fetch(url, {
-          method: 'GET',
+          // Resolver routes need GET because AIOStreams intentionally rejects
+          // HEAD. Redirects are kept manual so error-video redirects can be
+          // classified and final debrid/CDN media is never downloaded here.
+          method: resolverRoute ? 'GET' : 'HEAD',
           headers: {
-            Range: 'bytes=0-0',
             Accept:
-              'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, */*;q=0.5',
-            'User-Agent': 'AIOStreams final playback preflight',
+              'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, application/json, text/plain, */*;q=0.5',
+            'User-Agent': 'AIOStreams resolver preflight',
           },
-          redirect: 'follow',
+          redirect: 'manual',
           signal: controller.signal,
         });
 
@@ -3622,6 +3699,32 @@ class StreamFilterer {
             ?.toLowerCase()
             .split(';')[0]
             .trim() ?? '';
+
+        if (status >= 300 && status < 400) {
+          const location = response.headers.get('location');
+          try {
+            await response.body?.cancel();
+          } catch {}
+
+          if (!location) {
+            return {
+              status: 'failed',
+              reason: `Preflight failed: HTTP ${status} redirect without Location`,
+            };
+          }
+
+          const classified = classifyRedirectTarget(url, location);
+          if (!classified) {
+            return {
+              status: 'failed',
+              reason: 'Preflight failed: could not classify resolver redirect',
+            };
+          }
+          if ('nestedResolverUrl' in classified) {
+            return inspectUrl(classified.nestedResolverUrl, redirectDepth + 1);
+          }
+          return classified;
+        }
 
         if (status === 451 && hideLegalUnavailable) {
           try {
@@ -3640,6 +3743,19 @@ class StreamFilterer {
           return {
             status: 'inconclusive',
             reason: `Preflight inconclusive: HTTP ${status}`,
+          };
+        }
+
+        // Some direct media servers reject HEAD. Do not fall back to GET here:
+        // fetching media from the VPS defeats the purpose of a non-destructive
+        // resolver check and may interfere with IP-bound debrid playback.
+        if (!resolverRoute && status === 405) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return {
+            status: 'inconclusive',
+            reason: 'Preflight inconclusive: direct URL does not support HEAD',
           };
         }
 
@@ -3705,13 +3821,33 @@ class StreamFilterer {
 
             const nestedUrl = findNestedHttpUrl(parsedJson);
             if (nestedUrl && nestedUrl !== url) {
-              return inspectUrl(nestedUrl, redirectDepth + 1);
+              const classified = classifyRedirectTarget(url, nestedUrl);
+              if (!classified) {
+                return {
+                  status: 'failed',
+                  reason: 'Preflight failed: invalid resolver URL response',
+                };
+              }
+              if ('nestedResolverUrl' in classified) {
+                return inspectUrl(classified.nestedResolverUrl, redirectDepth + 1);
+              }
+              return classified;
             }
           }
 
           const plainUrl = /^https?:\/\/\S+$/i.test(body) ? body : undefined;
           if (plainUrl && plainUrl !== url) {
-            return inspectUrl(plainUrl, redirectDepth + 1);
+            const classified = classifyRedirectTarget(url, plainUrl);
+            if (!classified) {
+              return {
+                status: 'failed',
+                reason: 'Preflight failed: invalid resolver URL response',
+              };
+            }
+            if ('nestedResolverUrl' in classified) {
+              return inspectUrl(classified.nestedResolverUrl, redirectDepth + 1);
+            }
+            return classified;
           }
 
           if (errorBodyPattern.test(bodyLower)) {
@@ -3721,33 +3857,17 @@ class StreamFilterer {
             };
           }
 
-          // A final playback URL should resolve to media bytes, a media manifest,
-          // or a nested direct URL. A successful HTML/JSON/text page is therefore
-          // not considered playable even when its HTTP status is 200.
           return {
             status: 'failed',
             reason: `Preflight failed: unexpected ${contentType || 'text'} response`,
           };
         }
 
-        const bytes = await readBodySnippet(response, 1024);
-        if (bytes.length === 0) {
-          return {
-            status: 'failed',
-            reason: 'Preflight failed: empty response body',
-          };
-        }
-
-        const sample = decodeSnippet(bytes);
-        if (sample && errorBodyPattern.test(sample.toLowerCase())) {
-          return {
-            status: 'failed',
-            reason: 'Preflight failed: error response body',
-          };
-        }
-
-        // Unknown/binary content with data is accepted. Some debrid CDNs omit a
-        // useful content-type while still returning valid ranged video bytes.
+        // A resolver that directly returns a non-text body has produced a
+        // stream response. Cancel immediately and do not inspect media bytes.
+        try {
+          await response.body?.cancel();
+        } catch {}
         return { status: 'passed' };
       } catch (error) {
         const message =
@@ -3788,7 +3908,22 @@ class StreamFilterer {
         const stream = candidates[currentIndex];
         const url = getPreflightUrl(stream);
         if (!url) continue;
-        resultById.set(stream.id, await inspectUrl(url));
+        const preflightResult = await inspectUrl(url);
+        resultById.set(stream.id, preflightResult);
+
+        let host = 'unknown';
+        try {
+          host = new URL(url).host;
+        } catch {}
+        logger.debug('Anime resolver preflight result', {
+          id,
+          streamId: stream.id,
+          streamName: stream.name,
+          host,
+          route: isResolverUrl(url) ? 'resolver' : 'direct',
+          status: preflightResult.status,
+          reason: preflightResult.reason,
+        });
       }
     };
 
@@ -3812,7 +3947,7 @@ class StreamFilterer {
       }
     }
 
-    logger.info('Completed final anime playback preflight', {
+    logger.info('Completed final anime resolver preflight', {
       id,
       checked: candidates.length,
       passed:
