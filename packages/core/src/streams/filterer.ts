@@ -367,6 +367,35 @@ class StreamFilterer {
     const torrentioAnimeResolveMode = (
       process.env.TORRENTIO_ANIME_RESOLVE_MODE || 'allow'
     ).toLowerCase();
+    const numberEnv = (
+      value: string | undefined,
+      fallback: number,
+      min: number,
+      max: number
+    ): number => {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.min(max, Math.max(min, Math.floor(parsed)));
+    };
+    const animePreflightPlaybackCheck = boolEnv(
+      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK
+    );
+    const animePreflightPlaybackCheckLimit = numberEnv(
+      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
+      5,
+      0,
+      20
+    );
+    const animePreflightPlaybackTimeoutMs = numberEnv(
+      process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
+      3500,
+      500,
+      15000
+    );
+    const animeHideLegalUnavailable =
+      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE === undefined
+        ? true
+        : boolEnv(process.env.ANIME_HIDE_LEGAL_UNAVAILABLE);
 
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
@@ -2074,6 +2103,149 @@ class StreamFilterer {
       return /torrentio\.strem\.fun/.test(urlText) && /\/resolve\//.test(urlText);
     };
 
+    const getPreflightUrl = (stream: ParsedStream): string | undefined => {
+      const url = stream.url || stream.externalUrl;
+      if (!url || !/^https?:\/\//i.test(url)) return undefined;
+      return url;
+    };
+
+    const shouldPreflightAnimeStream = (stream: ParsedStream): boolean => {
+      if (!getPreflightUrl(stream)) return false;
+      // These are the two routes that have been observed to fail only at final
+      // playback time: AIOStreams' own debrid playback endpoint can expose a
+      // clear "unavailable/legal" error, while Torrentio resolve links may fail
+      // more opaquely. Only preflight top anime results, controlled by env vars.
+      return isAIOStreamsDebridPlaybackStream(stream) || isTorrentioResolveStream(stream);
+    };
+
+    const preflightAnimePlaybackStream = async (
+      stream: ParsedStream
+    ): Promise<string | undefined> => {
+      const url = getPreflightUrl(stream);
+      if (!url) return undefined;
+
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        animePreflightPlaybackTimeoutMs
+      );
+
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            // Ask for only the first byte so successful video responses do not
+            // download the media during stream-list generation.
+            Range: 'bytes=0-0',
+            'User-Agent': 'AIOStreams anime playback preflight',
+          },
+          redirect: 'follow',
+          signal: controller.signal,
+        });
+
+        const status = response.status;
+        const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
+
+        if (status === 451 && animeHideLegalUnavailable) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return 'Preflight failed: unavailable for legal reasons';
+        }
+
+        if (status >= 400 && status !== 429) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return `Preflight failed: HTTP ${status}`;
+        }
+
+        if (
+          contentType.includes('text/') ||
+          contentType.includes('html') ||
+          contentType.includes('json')
+        ) {
+          const body = (await response.text().catch(() => '')).toLowerCase();
+          if (
+            animeHideLegalUnavailable &&
+            /unavailable for legal reasons|legal reasons|try a different file/.test(body)
+          ) {
+            return 'Preflight failed: unavailable for legal reasons';
+          }
+
+          if (/not found|forbidden|blocked|error/.test(body) && status >= 300) {
+            return `Preflight failed: text error response ${status}`;
+          }
+        } else {
+          try {
+            await response.body?.cancel();
+          } catch {}
+        }
+
+        return undefined;
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error ?? 'unknown error');
+
+        // Timeouts and transient network failures are intentionally kept. Hiding
+        // them would create false negatives on slow debrid providers.
+        logger.debug('Anime playback preflight did not complete; keeping stream', {
+          id,
+          streamId: stream.id,
+          reason: message,
+        });
+        return undefined;
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
+    const preflightAnimePlaybackStreams = async (
+      streamsToPreflight: ParsedStream[]
+    ): Promise<ParsedStream[]> => {
+      if (
+        !isAnime ||
+        !animePreflightPlaybackCheck ||
+        animePreflightPlaybackCheckLimit <= 0
+      ) {
+        return streamsToPreflight;
+      }
+
+      const candidates = streamsToPreflight
+        .filter(
+          (stream) =>
+            !shouldPassthroughStage(stream, 'filter') &&
+            shouldPreflightAnimeStream(stream)
+        )
+        .slice(0, animePreflightPlaybackCheckLimit);
+
+      if (candidates.length === 0) return streamsToPreflight;
+
+      const results = await Promise.all(
+        candidates.map(async (stream) => ({
+          stream,
+          reason: await preflightAnimePlaybackStream(stream),
+        }))
+      );
+
+      const removalReasons = new Map<string, string>();
+      for (const { stream, reason } of results) {
+        if (!reason) continue;
+        removalReasons.set(stream.id, reason);
+        this.incrementRemovalReason('excludedFilterCondition', reason);
+      }
+
+      if (removalReasons.size === 0) return streamsToPreflight;
+
+      logger.info('Removed failed anime playback preflight streams', {
+        id,
+        removed: removalReasons.size,
+        checked: candidates.length,
+      });
+
+      return streamsToPreflight.filter((stream) => !removalReasons.has(stream.id));
+    };
+
     const normaliseStreamIdentity = (value: string | undefined): string =>
       (value ?? '')
         .toLowerCase()
@@ -3353,6 +3525,7 @@ class StreamFilterer {
     ]);
 
     finalStreams = optimiseAnimePlaybackStreams(finalStreams);
+    finalStreams = await preflightAnimePlaybackStreams(finalStreams);
 
     const totalMs = Date.now() - start;
     this.filterTimings.totalMs += totalMs;

@@ -1,68 +1,82 @@
-AIOStreams anime playback fallback patch
-=======================================
+AIOStreams anime playback preflight patch
+========================================
 
-This patch replaces the blunt anime TorBox block with safer fallback controls and
-adds anime playback-route cleanup for the Torrentio/AIOStreams resolver issue we
-found.
+Files changed:
+- packages/core/src/streams/filterer.ts
 
-Changed file:
-  packages/core/src/streams/filterer.ts
+What this patch adds
+--------------------
+This patch builds on the anime playback fallback patch. It keeps the existing
+logic that prefers AIOStreams debrid playback URLs over Torrentio resolve URLs,
+but adds an optional preflight check for the top anime playback links.
 
-New / updated env vars:
+The preflight check sends a lightweight HTTP Range request to the top anime
+stream URLs before returning them to Stremio. If a stream clearly returns a hard
+failure such as HTTP 451 / legal-unavailable, HTTP 403/404/410, or a text/html
+error body containing "Unavailable for Legal Reasons" / "Try a different file",
+AIOStreams removes that stream from the result list.
 
-  PREFER_AIOSTREAMS_PLAYBACK_FOR_ANIME="true"
-    - For anime, scores AIOStreams' own /api/v1/debrid/playback/ links above
-      Torrentio resolver links.
-    - If the same file appears through both AIOStreams playback and
-      torrentio.strem.fun/resolve, hides the Torrentio resolver duplicate.
+It intentionally keeps timeout/transient network failures instead of removing
+them, to avoid false negatives on slow debrid providers.
 
-  TORRENTIO_ANIME_RESOLVE_MODE="fallback"
-    Modes:
-      allow    = show Torrentio resolver anime links normally
-      demote   = keep them, but push them below non-Torrentio playback links
-      fallback = hide them when AIOStreams/non-Torrentio playback links exist;
-                 show them only if they are the only anime options
-      block    = remove all Torrentio resolver anime links
-
-  TORBOX_ANIME_MODE="fallback"
-    Modes:
-      allow    = show TorBox anime links normally
-      demote   = keep them, but push them below non-TorBox links
-      fallback = hide TorBox anime links when non-TorBox links exist;
-                 show TorBox only if it is the only anime option
-      block    = remove TorBox anime links entirely
-
-  ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK="false"
-    - Keeps the earlier safety change: Unknown language does not bypass English
-      requirements for foreign-original content unless explicitly enabled.
-
-Recommended docker-compose.yml environment lines:
+Recommended docker-compose.yml environment
+------------------------------------------
+Under services.aiostreams.environment, use:
 
   PREFER_AIOSTREAMS_PLAYBACK_FOR_ANIME: "true"
-  TORRENTIO_ANIME_RESOLVE_MODE: "fallback"
-  TORBOX_ANIME_MODE: "fallback"
+  TORRENTIO_ANIME_RESOLVE_MODE: "demote"
+  TORBOX_ANIME_MODE: "demote"
+  ANIME_PREFLIGHT_PLAYBACK_CHECK: "true"
+  ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT: "5"
+  ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS: "3500"
+  ANIME_HIDE_LEGAL_UNAVAILABLE: "true"
   ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK: "false"
 
-Important:
-  Remove or override the older env var:
-    DISABLE_TORBOX_FOR_ANIME: "true"
+Why demote instead of fallback/block?
+-------------------------------------
+The earlier TorBox anime block/fallback was intentionally conservative, but it
+could hide good TorBox anime links that were not tested. With preflight enabled,
+it is safer to let TorBox and Torrentio resolver links remain as lower-ranked
+fallbacks, while AIOStreams playback links are preferred and obvious failures are
+removed.
 
-  If DISABLE_TORBOX_FOR_ANIME is still present and TORBOX_ANIME_MODE is not set,
-  the code treats it as TORBOX_ANIME_MODE=block for backwards compatibility.
-  Setting TORBOX_ANIME_MODE=fallback overrides the old flag.
+Modes still supported
+---------------------
+TORBOX_ANIME_MODE:
+- allow    = leave TorBox anime normally
+- demote   = keep TorBox anime but rank below non-TorBox results
+- fallback = show TorBox anime only when no non-TorBox result exists
+- block    = remove TorBox anime entirely
 
-Deploy flow:
-  1. Extract this ZIP at the repo root and overwrite the file.
-  2. Commit and push.
-  3. Wait for GitHub Actions to build the Docker image.
-  4. On VPS:
-       cd /root/aiostreams
-       docker compose pull
-       docker compose up -d --force-recreate
+TORRENTIO_ANIME_RESOLVE_MODE:
+- allow    = leave Torrentio resolver links normally
+- demote   = keep them but rank below AIOStreams/non-Torrentio playback
+- fallback = show them only when no non-Torrentio result exists
+- block    = remove them entirely
 
-Expected behavior for the Mushoku / Jobless Reincarnation issue:
-  - The Torrentio Real-Debrid duplicate above the working AIOStreams playback
-    link should be hidden.
-  - AIOStreams playback links should rank first for anime.
-  - TorBox anime is not permanently deleted; it appears only as fallback when
-    no non-TorBox anime options exist.
+Deployment
+----------
+1. Copy/overwrite the changed file into your repo.
+2. Commit and push.
+3. Wait for GitHub Actions to build the image.
+4. On the VPS:
+
+   cd /root/aiostreams
+   docker compose pull
+   docker compose up -d --force-recreate
+
+Verify env vars:
+
+   docker inspect aiostreams --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'PREFER_AIOSTREAMS|TORRENTIO_ANIME|TORBOX_ANIME|ANIME_PREFLIGHT|ALLOW_FOREIGN'
+
+Verify patched code:
+
+   docker cp aiostreams:/app/packages/core/dist/streams/filterer.js /tmp/filterer.js
+   grep -E 'ANIME_PREFLIGHT_PLAYBACK_CHECK|preflightAnimePlaybackStreams|TORBOX_ANIME_MODE' /tmp/filterer.js
+
+Notes
+-----
+The preflight check is not a perfect proof that every link will play in every
+Stremio player. It only removes clear hard failures before they reach the user.
+Codec/player incompatibilities can still happen, especially with AV1, HEVC, or
+unusual containers.
