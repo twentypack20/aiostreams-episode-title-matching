@@ -80,3 +80,9 @@ Deployment
 
    docker logs aiostreams --since 20m 2>&1 \
      | grep -Ei 'resolver preflight|preflight result'
+
+TypeScript compile fix
+----------------------
+The debug log now reads the ParsedStream fields that actually exist:
+  stream.originalName ?? stream.filename ?? stream.addon.name
+This fixes TS2339 at filterer.ts line 3921 (`stream.name` is not a ParsedStream field).

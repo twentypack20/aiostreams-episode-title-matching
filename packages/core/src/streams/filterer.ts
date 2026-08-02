@@ -3918,7 +3918,7 @@ class StreamFilterer {
         logger.debug('Anime resolver preflight result', {
           id,
           streamId: stream.id,
-          streamName: stream.name,
+          streamName: stream.originalName ?? stream.filename ?? stream.addon.name,
           host,
           route: isResolverUrl(url) ? 'resolver' : 'direct',
           status: preflightResult.status,

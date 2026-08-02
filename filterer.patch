@@ -748,7 +748,7 @@ index 29e4cde..233988b 100644
 +        logger.debug('Anime resolver preflight result', {
 +          id,
 +          streamId: stream.id,
-+          streamName: stream.name,
++          streamName: stream.originalName ?? stream.filename ?? stream.addon.name,
 +          host,
 +          route: isResolverUrl(url) ? 'resolver' : 'direct',
 +          status: preflightResult.status,
