@@ -367,35 +367,6 @@ class StreamFilterer {
     const torrentioAnimeResolveMode = (
       process.env.TORRENTIO_ANIME_RESOLVE_MODE || 'allow'
     ).toLowerCase();
-    const numberEnv = (
-      value: string | undefined,
-      fallback: number,
-      min: number,
-      max: number
-    ): number => {
-      const parsed = Number(value);
-      if (!Number.isFinite(parsed)) return fallback;
-      return Math.min(max, Math.max(min, Math.floor(parsed)));
-    };
-    const animePreflightPlaybackCheck = boolEnv(
-      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK
-    );
-    const animePreflightPlaybackCheckLimit = numberEnv(
-      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
-      5,
-      0,
-      20
-    );
-    const animePreflightPlaybackTimeoutMs = numberEnv(
-      process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
-      3500,
-      500,
-      15000
-    );
-    const animeHideLegalUnavailable =
-      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE === undefined
-        ? true
-        : boolEnv(process.env.ANIME_HIDE_LEGAL_UNAVAILABLE);
 
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
@@ -2103,149 +2074,6 @@ class StreamFilterer {
       return /torrentio\.strem\.fun/.test(urlText) && /\/resolve\//.test(urlText);
     };
 
-    const getPreflightUrl = (stream: ParsedStream): string | undefined => {
-      const url = stream.url || stream.externalUrl;
-      if (!url || !/^https?:\/\//i.test(url)) return undefined;
-      return url;
-    };
-
-    const shouldPreflightAnimeStream = (stream: ParsedStream): boolean => {
-      if (!getPreflightUrl(stream)) return false;
-      // These are the two routes that have been observed to fail only at final
-      // playback time: AIOStreams' own debrid playback endpoint can expose a
-      // clear "unavailable/legal" error, while Torrentio resolve links may fail
-      // more opaquely. Only preflight top anime results, controlled by env vars.
-      return isAIOStreamsDebridPlaybackStream(stream) || isTorrentioResolveStream(stream);
-    };
-
-    const preflightAnimePlaybackStream = async (
-      stream: ParsedStream
-    ): Promise<string | undefined> => {
-      const url = getPreflightUrl(stream);
-      if (!url) return undefined;
-
-      const controller = new AbortController();
-      const timeout = setTimeout(
-        () => controller.abort(),
-        animePreflightPlaybackTimeoutMs
-      );
-
-      try {
-        const response = await fetch(url, {
-          method: 'GET',
-          headers: {
-            // Ask for only the first byte so successful video responses do not
-            // download the media during stream-list generation.
-            Range: 'bytes=0-0',
-            'User-Agent': 'AIOStreams anime playback preflight',
-          },
-          redirect: 'follow',
-          signal: controller.signal,
-        });
-
-        const status = response.status;
-        const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-
-        if (status === 451 && animeHideLegalUnavailable) {
-          try {
-            await response.body?.cancel();
-          } catch {}
-          return 'Preflight failed: unavailable for legal reasons';
-        }
-
-        if (status >= 400 && status !== 429) {
-          try {
-            await response.body?.cancel();
-          } catch {}
-          return `Preflight failed: HTTP ${status}`;
-        }
-
-        if (
-          contentType.includes('text/') ||
-          contentType.includes('html') ||
-          contentType.includes('json')
-        ) {
-          const body = (await response.text().catch(() => '')).toLowerCase();
-          if (
-            animeHideLegalUnavailable &&
-            /unavailable for legal reasons|legal reasons|try a different file/.test(body)
-          ) {
-            return 'Preflight failed: unavailable for legal reasons';
-          }
-
-          if (/not found|forbidden|blocked|error/.test(body) && status >= 300) {
-            return `Preflight failed: text error response ${status}`;
-          }
-        } else {
-          try {
-            await response.body?.cancel();
-          } catch {}
-        }
-
-        return undefined;
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : String(error ?? 'unknown error');
-
-        // Timeouts and transient network failures are intentionally kept. Hiding
-        // them would create false negatives on slow debrid providers.
-        logger.debug('Anime playback preflight did not complete; keeping stream', {
-          id,
-          streamId: stream.id,
-          reason: message,
-        });
-        return undefined;
-      } finally {
-        clearTimeout(timeout);
-      }
-    };
-
-    const preflightAnimePlaybackStreams = async (
-      streamsToPreflight: ParsedStream[]
-    ): Promise<ParsedStream[]> => {
-      if (
-        !isAnime ||
-        !animePreflightPlaybackCheck ||
-        animePreflightPlaybackCheckLimit <= 0
-      ) {
-        return streamsToPreflight;
-      }
-
-      const candidates = streamsToPreflight
-        .filter(
-          (stream) =>
-            !shouldPassthroughStage(stream, 'filter') &&
-            shouldPreflightAnimeStream(stream)
-        )
-        .slice(0, animePreflightPlaybackCheckLimit);
-
-      if (candidates.length === 0) return streamsToPreflight;
-
-      const results = await Promise.all(
-        candidates.map(async (stream) => ({
-          stream,
-          reason: await preflightAnimePlaybackStream(stream),
-        }))
-      );
-
-      const removalReasons = new Map<string, string>();
-      for (const { stream, reason } of results) {
-        if (!reason) continue;
-        removalReasons.set(stream.id, reason);
-        this.incrementRemovalReason('excludedFilterCondition', reason);
-      }
-
-      if (removalReasons.size === 0) return streamsToPreflight;
-
-      logger.info('Removed failed anime playback preflight streams', {
-        id,
-        removed: removalReasons.size,
-        checked: candidates.length,
-      });
-
-      return streamsToPreflight.filter((stream) => !removalReasons.has(stream.id));
-    };
-
     const normaliseStreamIdentity = (value: string | undefined): string =>
       (value ?? '')
         .toLowerCase()
@@ -3525,7 +3353,6 @@ class StreamFilterer {
     ]);
 
     finalStreams = optimiseAnimePlaybackStreams(finalStreams);
-    finalStreams = await preflightAnimePlaybackStreams(finalStreams);
 
     const totalMs = Date.now() - start;
     this.filterTimings.totalMs += totalMs;
@@ -3562,6 +3389,463 @@ class StreamFilterer {
     );
     return finalStreams;
   }
+  /**
+   * Preflight the final anime playback list after sorting, limiting, stream
+   * expression filtering, and fallback insertion. This deliberately checks the
+   * exact HTTP(S) stream URLs that are about to be returned to Stremio, rather
+   * than only checking a provider-specific subset earlier in the pipeline.
+   */
+  public async preflightPlaybackStreams(
+    streams: ParsedStream[],
+    context: StreamContext
+  ): Promise<ParsedStream[]> {
+    const { id, isAnime } = context;
+    const boolEnv = (value: string | undefined): boolean =>
+      /^(1|true|yes|on)$/i.test(value ?? '');
+    const numberEnv = (
+      value: string | undefined,
+      fallback: number,
+      min: number,
+      max: number
+    ): number => {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.min(max, Math.max(min, Math.floor(parsed)));
+    };
+
+    const enabled = boolEnv(process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK);
+    if (!isAnime || !enabled || streams.length === 0) return streams;
+
+    // A limit of 0 means check every final playable stream. A positive value is
+    // retained as an emergency cap for users with unusually large result lists.
+    const configuredLimit = numberEnv(
+      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
+      0,
+      0,
+      100
+    );
+    const timeoutMs = numberEnv(
+      process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
+      7000,
+      500,
+      30000
+    );
+    const concurrency = numberEnv(
+      process.env.ANIME_PREFLIGHT_PLAYBACK_CONCURRENCY,
+      3,
+      1,
+      10
+    );
+    const hideLegalUnavailable =
+      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE === undefined
+        ? true
+        : boolEnv(process.env.ANIME_HIDE_LEGAL_UNAVAILABLE);
+    const inconclusiveMode = (
+      process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE || 'keep'
+    ).toLowerCase();
+
+    type PreflightStatus = 'passed' | 'failed' | 'inconclusive';
+    type PreflightResult = {
+      status: PreflightStatus;
+      reason?: string;
+    };
+
+    const getPreflightUrl = (stream: ParsedStream): string | undefined => {
+      if (stream.url && /^https?:\/\//i.test(stream.url)) {
+        return stream.url;
+      }
+
+      // externalUrl can legitimately point to a normal website rather than a
+      // playable media resource. Only preflight it when it is clearly one of
+      // the resolver/playback routes this feature is intended to validate.
+      if (
+        stream.externalUrl &&
+        /^https?:\/\//i.test(stream.externalUrl) &&
+        /\/api\/v1\/debrid\/playback\/|\/resolve\//i.test(stream.externalUrl)
+      ) {
+        return stream.externalUrl;
+      }
+      return undefined;
+    };
+
+    const readBodySnippet = async (
+      response: Response,
+      maxBytes: number = 64 * 1024
+    ): Promise<Uint8Array> => {
+      if (!response.body) return new Uint8Array();
+
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+
+      try {
+        while (total < maxBytes) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value || value.length === 0) continue;
+
+          const remaining = maxBytes - total;
+          const chunk =
+            value.length > remaining ? value.slice(0, remaining) : value;
+          chunks.push(chunk);
+          total += chunk.length;
+
+          if (value.length > remaining) break;
+        }
+      } finally {
+        try {
+          await reader.cancel();
+        } catch {}
+      }
+
+      const combined = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return combined;
+    };
+
+    const decodeSnippet = (bytes: Uint8Array): string => {
+      try {
+        return new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim();
+      } catch {
+        return '';
+      }
+    };
+
+    const findNestedHttpUrl = (
+      value: unknown,
+      depth: number = 0
+    ): string | undefined => {
+      if (depth > 5 || value === null || value === undefined) return undefined;
+      if (typeof value === 'string') {
+        const trimmed = value.trim().replace(/^['"]|['"]$/g, '');
+        return /^https?:\/\/\S+$/i.test(trimmed) ? trimmed : undefined;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          const found = findNestedHttpUrl(item, depth + 1);
+          if (found) return found;
+        }
+        return undefined;
+      }
+      if (typeof value === 'object') {
+        for (const nested of Object.values(value as Record<string, unknown>)) {
+          const found = findNestedHttpUrl(nested, depth + 1);
+          if (found) return found;
+        }
+      }
+      return undefined;
+    };
+
+    const getJsonError = (value: unknown): string | undefined => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+      const object = value as Record<string, unknown>;
+
+      if (object.success === false) {
+        return String(object.message ?? object.error ?? 'resolver reported success=false');
+      }
+
+      for (const key of ['error', 'errors']) {
+        const error = object[key];
+        if (
+          error !== undefined &&
+          error !== null &&
+          error !== false &&
+          error !== '' &&
+          !(Array.isArray(error) && error.length === 0)
+        ) {
+          return typeof error === 'string' ? error : JSON.stringify(error);
+        }
+      }
+
+      const message = object.message;
+      if (
+        typeof message === 'string' &&
+        /unavailable|not available|not found|forbidden|blocked|expired|invalid|failed|failure|legal reasons|different file|not cached|uncached/i.test(
+          message
+        )
+      ) {
+        return message;
+      }
+      return undefined;
+    };
+
+    const errorBodyPattern =
+      /unavailable for legal reasons|legal reasons|try a different file|not available|unavailable|file not found|torrent not found|no (?:stream|link|file)s? found|invalid (?:torrent|magnet|link|file)|forbidden|access denied|permission denied|blocked|expired|not cached|uncached|resolver (?:error|failed)|playback (?:error|failed)|failed to (?:resolve|fetch|play)|could not (?:resolve|fetch|play)/i;
+
+    const isMediaContentType = (contentType: string): boolean =>
+      /^(video|audio)\//.test(contentType) ||
+      /application\/(?:octet-stream|x-matroska|mp4|vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)/.test(
+        contentType
+      );
+
+    const isTextLikeContentType = (contentType: string): boolean =>
+      contentType.includes('text/') ||
+      contentType.includes('html') ||
+      contentType.includes('json') ||
+      contentType.includes('problem+json');
+
+    const inspectUrl = async (
+      url: string,
+      redirectDepth: number = 0
+    ): Promise<PreflightResult> => {
+      if (redirectDepth > 2) {
+        return {
+          status: 'failed',
+          reason: 'Preflight failed: resolver returned too many nested URLs',
+        };
+      }
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            Range: 'bytes=0-0',
+            Accept:
+              'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, */*;q=0.5',
+            'User-Agent': 'AIOStreams final playback preflight',
+          },
+          redirect: 'follow',
+          signal: controller.signal,
+        });
+
+        const status = response.status;
+        const contentType =
+          response.headers
+            .get('content-type')
+            ?.toLowerCase()
+            .split(';')[0]
+            .trim() ?? '';
+
+        if (status === 451 && hideLegalUnavailable) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return {
+            status: 'failed',
+            reason: 'Preflight failed: unavailable for legal reasons',
+          };
+        }
+
+        if ([408, 425, 429, 500, 502, 503, 504].includes(status)) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return {
+            status: 'inconclusive',
+            reason: `Preflight inconclusive: HTTP ${status}`,
+          };
+        }
+
+        if (status >= 400) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return {
+            status: 'failed',
+            reason: `Preflight failed: HTTP ${status}`,
+          };
+        }
+
+        if (status === 204) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return {
+            status: 'failed',
+            reason: 'Preflight failed: empty HTTP 204 response',
+          };
+        }
+
+        if (isMediaContentType(contentType)) {
+          try {
+            await response.body?.cancel();
+          } catch {}
+          return { status: 'passed' };
+        }
+
+        if (isTextLikeContentType(contentType)) {
+          const bytes = await readBodySnippet(response);
+          const body = decodeSnippet(bytes);
+          const bodyLower = body.toLowerCase();
+
+          if (
+            hideLegalUnavailable &&
+            /unavailable for legal reasons|legal reasons|infring(?:e|ing|ement)/i.test(
+              bodyLower
+            )
+          ) {
+            return {
+              status: 'failed',
+              reason: 'Preflight failed: unavailable for legal reasons',
+            };
+          }
+
+          let parsedJson: unknown;
+          if (contentType.includes('json') || /^[\[{]/.test(body)) {
+            try {
+              parsedJson = JSON.parse(body);
+            } catch {}
+          }
+
+          if (parsedJson !== undefined) {
+            const jsonError = getJsonError(parsedJson);
+            if (jsonError) {
+              return {
+                status: 'failed',
+                reason: `Preflight failed: ${jsonError.slice(0, 180)}`,
+              };
+            }
+
+            const nestedUrl = findNestedHttpUrl(parsedJson);
+            if (nestedUrl && nestedUrl !== url) {
+              return inspectUrl(nestedUrl, redirectDepth + 1);
+            }
+          }
+
+          const plainUrl = /^https?:\/\/\S+$/i.test(body) ? body : undefined;
+          if (plainUrl && plainUrl !== url) {
+            return inspectUrl(plainUrl, redirectDepth + 1);
+          }
+
+          if (errorBodyPattern.test(bodyLower)) {
+            return {
+              status: 'failed',
+              reason: `Preflight failed: resolver error response (${status})`,
+            };
+          }
+
+          // A final playback URL should resolve to media bytes, a media manifest,
+          // or a nested direct URL. A successful HTML/JSON/text page is therefore
+          // not considered playable even when its HTTP status is 200.
+          return {
+            status: 'failed',
+            reason: `Preflight failed: unexpected ${contentType || 'text'} response`,
+          };
+        }
+
+        const bytes = await readBodySnippet(response, 1024);
+        if (bytes.length === 0) {
+          return {
+            status: 'failed',
+            reason: 'Preflight failed: empty response body',
+          };
+        }
+
+        const sample = decodeSnippet(bytes);
+        if (sample && errorBodyPattern.test(sample.toLowerCase())) {
+          return {
+            status: 'failed',
+            reason: 'Preflight failed: error response body',
+          };
+        }
+
+        // Unknown/binary content with data is accepted. Some debrid CDNs omit a
+        // useful content-type while still returning valid ranged video bytes.
+        return { status: 'passed' };
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error ?? 'unknown error');
+        const timedOut =
+          error instanceof Error &&
+          (error.name === 'AbortError' || /aborted|timeout/i.test(message));
+        return {
+          status: 'inconclusive',
+          reason: timedOut
+            ? `Preflight inconclusive: timed out after ${timeoutMs} ms`
+            : `Preflight inconclusive: ${message}`,
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
+    const allCandidates = streams.filter(
+      (stream) =>
+        stream.type !== 'info' && getPreflightUrl(stream) !== undefined
+    );
+    const candidates =
+      configuredLimit > 0
+        ? allCandidates.slice(0, configuredLimit)
+        : allCandidates;
+
+    if (candidates.length === 0) return streams;
+
+    const resultById = new Map<string, PreflightResult>();
+    let nextIndex = 0;
+    const workerCount = Math.min(concurrency, candidates.length);
+
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const currentIndex = nextIndex++;
+        if (currentIndex >= candidates.length) return;
+        const stream = candidates[currentIndex];
+        const url = getPreflightUrl(stream);
+        if (!url) continue;
+        resultById.set(stream.id, await inspectUrl(url));
+      }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    const failedIds = new Set<string>();
+    const inconclusiveIds = new Set<string>();
+
+    for (const stream of candidates) {
+      const result = resultById.get(stream.id);
+      if (!result || result.status === 'passed') continue;
+
+      if (result.status === 'failed') {
+        failedIds.add(stream.id);
+        this.incrementRemovalReason(
+          'excludedFilterCondition',
+          result.reason ?? 'Playback preflight failed'
+        );
+      } else {
+        inconclusiveIds.add(stream.id);
+      }
+    }
+
+    logger.info('Completed final anime playback preflight', {
+      id,
+      checked: candidates.length,
+      passed:
+        candidates.length - failedIds.size - inconclusiveIds.size,
+      failed: failedIds.size,
+      inconclusive: inconclusiveIds.size,
+      configuredLimit,
+      concurrency,
+      timeoutMs,
+      inconclusiveMode,
+    });
+
+    let result = streams.filter((stream) => !failedIds.has(stream.id));
+
+    if (inconclusiveMode === 'remove') {
+      for (const stream of result) {
+        if (!inconclusiveIds.has(stream.id)) continue;
+        const reason =
+          resultById.get(stream.id)?.reason ??
+          'Playback preflight was inconclusive';
+        this.incrementRemovalReason('excludedFilterCondition', reason);
+      }
+      result = result.filter((stream) => !inconclusiveIds.has(stream.id));
+    } else if (inconclusiveMode === 'demote') {
+      result = [
+        ...result.filter((stream) => !inconclusiveIds.has(stream.id)),
+        ...result.filter((stream) => inconclusiveIds.has(stream.id)),
+      ];
+    }
+
+    return result;
+  }
+
   private getDisplayCondition(expression: string): string {
     const names = extractNamesFromExpression(expression);
     if (names && names.length > 0) {

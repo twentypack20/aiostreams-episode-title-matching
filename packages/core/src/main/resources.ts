@@ -359,6 +359,14 @@ export async function processStreams(
     }
   }
 
+  // Preflight the exact final list that will be returned to Stremio. Running
+  // this here ensures AIOStreams, Torrentio/Real-Debrid, Torrentio/TorBox, and
+  // any other HTTP playback URLs are all checked after sorting and limits.
+  finalStreams = await ctx.filterer.preflightPlaybackStreams(
+    finalStreams,
+    context
+  );
+
   ctx.filterer.generateFilterSummary(streams, finalStreams, type, id);
 
   const { streams: proxiedStreams, error } =
