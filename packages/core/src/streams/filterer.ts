@@ -351,8 +351,12 @@ class StreamFilterer {
   ): Promise<ParsedStream[]> {
     const { type, id, parsedId, isAnime } = context;
     const episodeTitleDebug = process.env.EPISODE_TITLE_DEBUG === 'true';
-    const allowForeignOriginalUnknownLanguageFallback =
-      process.env.ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK === 'true';
+    const boolEnv = (value: string | undefined): boolean =>
+      /^(1|true|yes|on)$/i.test(value ?? '');
+    const allowForeignOriginalUnknownLanguageFallback = boolEnv(
+      process.env.ALLOW_FOREIGN_ORIGINAL_UNKNOWN_LANGUAGE_FALLBACK
+    );
+    const disableTorboxForAnime = boolEnv(process.env.DISABLE_TORBOX_FOR_ANIME);
 
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
@@ -1809,6 +1813,8 @@ class StreamFilterer {
       const file = stream.parsedFile;
       const languages = file?.languages ?? [];
       const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
+      const originalLanguageLower = originalLanguage?.toLowerCase();
+
       if (languageSet.has('dual audio') || languageSet.has('dubbed')) {
         return true;
       }
@@ -1817,10 +1823,14 @@ class StreamFilterer {
         return true;
       }
 
-      // Do not treat "original language + English" as a strong English-audio signal
-      // by itself. Many anime/foreign releases parse subtitle language tags such as
-      // "JPN SUB ENG" into languages=["Japanese", "English"], which is not proof of
-      // English audio. Require an explicit dual-audio/dub marker instead.
+      if (
+        originalLanguageLower &&
+        originalLanguageLower !== 'english' &&
+        languageSet.has(originalLanguageLower) &&
+        languageSet.has('english')
+      ) {
+        return true;
+      }
 
       const haystack = normaliseLooseText(
         [
@@ -1839,69 +1849,18 @@ class StreamFilterer {
       );
     };
 
-    const hasSubtitleLanguageEvidence = (stream: ParsedStream): boolean => {
-      const file = stream.parsedFile;
-      if (file?.subtitles?.some((lang) => lang === 'English')) {
-        return true;
-      }
-
-      const haystack = normaliseLooseText(
-        [
-          stream.filename,
-          stream.folderName,
-          stream.originalName,
-          file?.title,
-          file?.releaseGroup,
-        ]
-          .filter(Boolean)
-          .join(' ')
-      );
-
-      return /\b(multi subs?|multi subtitles?|subs?|subtitles?|subtitle|softsubs?|hardsubs?)\b/.test(
-        haystack
-      );
-    };
-
     const shouldRejectLikelySubtitleOnlyEnglishAnime = (
       stream: ParsedStream
     ): boolean => {
       const file = stream.parsedFile;
       const languages = file?.languages?.length ? file.languages : ['Unknown'];
-      const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
 
+      if (!isAnime) return false;
       if (!this.userData.requiredLanguages?.includes('English' as any)) {
         return false;
       }
-      if (!languages.includes('English' as any)) return false;
-
-      const hasExplicitNonEnglishLanguage = languages.some((lang) => {
-        const lower = lang.toLowerCase();
-        return ![
-          'english',
-          'dual audio',
-          'dubbed',
-          'multi',
-          'unknown',
-          'original',
-        ].includes(lower);
-      });
-
-      // For anime, be strict even when TMDB/metadata does not provide a reliable
-      // originalLanguage value. A plain GB/JP or English/Japanese tag without
-      // Dual Audio/Dubbed is often English subtitles plus Japanese audio. Do not
-      // reject plain English-only anime releases unless there is subtitle evidence
-      // or another explicit non-English language tag.
-      if (isAnime) {
-        if (hasStrongEnglishAudioSignal(stream)) return false;
-        return hasExplicitNonEnglishLanguage || hasSubtitleLanguageEvidence(stream);
-      }
-
-      // Non-anime foreign-original content is a little looser: only reject when the
-      // content metadata says it is not English-original and there is clear subtitle
-      // evidence. This avoids over-filtering live-action foreign shows that may have
-      // weak or missing audio tags.
       if (!originalLanguage || originalLanguage === 'English') return false;
-      if (!hasSubtitleLanguageEvidence(stream)) return false;
+      if (!languages.includes('English' as any)) return false;
 
       return !hasStrongEnglishAudioSignal(stream);
     };
@@ -2076,8 +2035,34 @@ class StreamFilterer {
       return languages.every((lang) => lang === 'Unknown');
     };
 
+    const isTorboxStream = (stream: ParsedStream): boolean => {
+      if (stream.service?.id?.toLowerCase() === 'torbox') {
+        return true;
+      }
+
+      const bingeGroupParts = (stream.bingeGroup ?? '')
+        .toLowerCase()
+        .split('|')
+        .map((part) => part.trim());
+
+      if (bingeGroupParts.includes('torbox')) {
+        return true;
+      }
+
+      const urlText = `${stream.url ?? ''} ${stream.externalUrl ?? ''}`.toLowerCase();
+      return /\/resolve\/torbox\//.test(urlText) || /[?&]service=torbox\b/.test(urlText);
+    };
+
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
+
+      if (isAnime && disableTorboxForAnime && isTorboxStream(stream)) {
+        this.incrementRemovalReason(
+          'excludedFilterCondition',
+          'TorBox disabled for anime'
+        );
+        return false;
+      }
 
       const skipLanguageFiltering = shouldPassthroughStage(stream, 'language');
       const skipSubtitleFiltering = shouldPassthroughStage(stream, 'subtitle');
