@@ -1,0 +1,12 @@
+Validation performed
+====================
+- TypeScript syntax transpilation of packages/server/src/routes/api/debrid.ts: passed.
+- Strict TypeScript check of debrid.ts against focused interface stubs: passed.
+- git diff --check on modified source/docs (excluding the patch-as-data file): passed.
+- debrid-resolution-retry.patch dry-run against the prior compile-fixed bundle: passed.
+
+Not performed
+=============
+- Full pnpm workspace build. The execution environment could not reach the npm
+  registry and did not contain the repository dependencies. GitHub Actions must
+  run pnpm run build after upload.

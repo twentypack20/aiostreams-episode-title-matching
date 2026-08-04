@@ -1,0 +1,448 @@
+--- a/.env.sample
++++ b/.env.sample
+@@ -136,3 +136,25 @@
+ # default in the reference:
+ #   https://docs.aiostreams.viren070.me/configuration/environment-variables
+ # ==============================================================================
++
++# ==============================================================================
++#               CUSTOM PLAYBACK-TIME DEBRID RESOLUTION RETRY
++# ==============================================================================
++# Number of retries after the initial /api/v1/debrid/playback resolve attempt.
++# Set to 0 to disable. Allowed range: 0-5.
++# DEBRID_RESOLVE_RETRIES=2
++
++# Base retry delay in milliseconds. Delay doubles for each subsequent retry.
++# DEBRID_RESOLVE_RETRY_DELAY_MS=750
++
++# Maximum delay between retries in milliseconds.
++# DEBRID_RESOLVE_RETRY_MAX_DELAY_MS=4000
++
++# Retrying HTTP 429 is disabled by default to avoid worsening provider rate
++# limits. Enable only when you understand the provider's Retry-After behavior.
++# DEBRID_RESOLVE_RETRY_ON_RATE_LIMIT=false
++
++# Retry uncategorized exceptions from the debrid resolve call. Permanent known
++# errors (legal, auth, account/payment, invalid file, no matching file) are
++# never retried regardless of this setting.
++# DEBRID_RESOLVE_RETRY_UNKNOWN_ERRORS=true
+--- a/README.txt
++++ b/README.txt
+@@ -5,6 +5,8 @@
+ -------------
+ - packages/core/src/streams/filterer.ts
+ - packages/core/src/main/resources.ts
++- packages/server/src/routes/api/debrid.ts
++- .env.sample
+ 
+ Why the previous universal preflight failed
+ -------------------------------------------
+@@ -80,3 +82,51 @@
+ 
+    docker logs aiostreams --since 20m 2>&1 \
+      | grep -Ei 'resolver preflight|preflight result'
++
++Playback-time debrid resolution retry
++-------------------------------------
++The resolver preflight runs while the stream list is built. A separate failure
++can still happen after a user clicks an AIOStreams cloud/playback link: the
++playback route calls the configured debrid service and either redirects to the
++real media URL or redirects to an AIOStreams error video.
++
++This patch retries temporary failures inside the AIOStreams playback route
++before it returns that error video. It applies to links using:
++
++  /api/v1/debrid/playback/...
++
++It cannot change retry behavior inside a direct third-party resolver URL such
++as torrentio.strem.fun/resolve/....
++
++Default behavior:
++- 1 initial resolution attempt plus 2 retries.
++- Exponential delays of 750 ms and 1500 ms.
++- Retries transient server/network errors and unknown 5xx-style failures.
++- Does not retry permanent conditions such as legal blocks, invalid files,
++  authentication failures, payment/account limits, or no matching file.
++- Does not retry HTTP 429/rate limits by default, because repeated rejected
++  requests can worsen provider throttling.
++- Does not log encrypted credentials, resolver URLs, or final media URLs.
++
++Recommended docker-compose.yml environment
++------------------------------------------
++  DEBRID_RESOLVE_RETRIES: "2"
++  DEBRID_RESOLVE_RETRY_DELAY_MS: "750"
++  DEBRID_RESOLVE_RETRY_MAX_DELAY_MS: "4000"
++  DEBRID_RESOLVE_RETRY_ON_RATE_LIMIT: "false"
++  DEBRID_RESOLVE_RETRY_UNKNOWN_ERRORS: "true"
++
++DEBRID_RESOLVE_RETRIES counts retries after the initial attempt. Set it to 0 to
++turn playback-time retries off without rebuilding.
++
++Useful logs
++-----------
++  docker logs aiostreams --since 20m 2>&1 \
++    | grep -Ei 'debrid resolve.*retry|retries exhausted'
++
++A successful automatic recovery is logged as:
++
++  Debrid resolve retry succeeded
++
++AIOStreams will still return its normal error video if all allowed attempts
++fail or if the failure is classified as permanent.
+--- a/packages/server/src/routes/api/debrid.ts
++++ b/packages/server/src/routes/api/debrid.ts
+@@ -31,6 +31,227 @@
+ const router: Router = Router();
+ const logger = createLogger('server');
+ 
++type ResolveRetryDecision = {
++  retry: boolean;
++  reason: string;
++  retryAfterMs?: number;
++};
++
++const parseIntegerEnv = (
++  value: string | undefined,
++  fallback: number,
++  min: number,
++  max: number
++): number => {
++  if (value === undefined || value.trim() === '') return fallback;
++  const parsed = Number(value);
++  if (!Number.isFinite(parsed)) return fallback;
++  return Math.min(max, Math.max(min, Math.floor(parsed)));
++};
++
++const parseBooleanEnv = (
++  value: string | undefined,
++  fallback: boolean
++): boolean => {
++  if (value === undefined || value.trim() === '') return fallback;
++  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
++};
++
++const resolveRetryConfig = {
++  retries: parseIntegerEnv(process.env.DEBRID_RESOLVE_RETRIES, 2, 0, 5),
++  delayMs: parseIntegerEnv(
++    process.env.DEBRID_RESOLVE_RETRY_DELAY_MS,
++    750,
++    100,
++    30_000
++  ),
++  maxDelayMs: parseIntegerEnv(
++    process.env.DEBRID_RESOLVE_RETRY_MAX_DELAY_MS,
++    4_000,
++    100,
++    30_000
++  ),
++  retryRateLimits: parseBooleanEnv(
++    process.env.DEBRID_RESOLVE_RETRY_ON_RATE_LIMIT,
++    false
++  ),
++  retryUnknownErrors: parseBooleanEnv(
++    process.env.DEBRID_RESOLVE_RETRY_UNKNOWN_ERRORS,
++    true
++  ),
++};
++
++const permanentResolveErrorCodes = new Set<DebridError['code']>([
++  'BAD_REQUEST',
++  'CONFLICT',
++  'FORBIDDEN',
++  'GONE',
++  'METHOD_NOT_ALLOWED',
++  'NOT_FOUND',
++  'NOT_IMPLEMENTED',
++  'PAYMENT_REQUIRED',
++  'PROXY_AUTHENTICATION_REQUIRED',
++  'STORE_LIMIT_EXCEEDED',
++  'STORE_MAGNET_INVALID',
++  'UNAUTHORIZED',
++  'UNAVAILABLE_FOR_LEGAL_REASONS',
++  'UNPROCESSABLE_ENTITY',
++  'UNSUPPORTED_MEDIA_TYPE',
++  'NO_MATCHING_FILE',
++]);
++
++const transientResolveErrorCodes = new Set<DebridError['code']>([
++  'BAD_GATEWAY',
++  'INTERNAL_SERVER_ERROR',
++  'SERVICE_UNAVAILABLE',
++]);
++
++const transientNetworkErrorCodes = new Set([
++  'ABORT_ERR',
++  'ECONNABORTED',
++  'ECONNREFUSED',
++  'ECONNRESET',
++  'EHOSTUNREACH',
++  'ENETUNREACH',
++  'ENOTFOUND',
++  'ETIMEDOUT',
++  'UND_ERR_CONNECT_TIMEOUT',
++  'UND_ERR_HEADERS_TIMEOUT',
++  'UND_ERR_SOCKET',
++]);
++
++const sleep = (milliseconds: number): Promise<void> =>
++  new Promise((resolve) => setTimeout(resolve, milliseconds));
++
++const getHeader = (
++  headers: Record<string, string> | undefined,
++  name: string
++): string | undefined => {
++  if (!headers) return undefined;
++  const target = name.toLowerCase();
++  const entry = Object.entries(headers).find(
++    ([key]) => key.toLowerCase() === target
++  );
++  return entry?.[1];
++};
++
++const parseRetryAfterMs = (error: unknown): number | undefined => {
++  if (!(error instanceof DebridError)) return undefined;
++  const value = getHeader(error.headers, 'retry-after');
++  if (!value) return undefined;
++
++  const seconds = Number(value);
++  if (Number.isFinite(seconds) && seconds >= 0) {
++    return Math.floor(seconds * 1000);
++  }
++
++  const retryAt = Date.parse(value);
++  if (!Number.isFinite(retryAt)) return undefined;
++  return Math.max(0, retryAt - Date.now());
++};
++
++const findErrorCode = (error: unknown): string | undefined => {
++  const seen = new Set<unknown>();
++  let current: unknown = error;
++
++  while (current && typeof current === 'object' && !seen.has(current)) {
++    seen.add(current);
++    const record = current as Record<string, unknown>;
++    if (typeof record.code === 'string') return record.code.toUpperCase();
++    current = record.cause;
++  }
++
++  return undefined;
++};
++
++const classifyResolveError = (error: unknown): ResolveRetryDecision => {
++  if (error instanceof DebridError) {
++    if (error.code === 'TOO_MANY_REQUESTS') {
++      return {
++        retry: resolveRetryConfig.retryRateLimits,
++        reason: resolveRetryConfig.retryRateLimits
++          ? 'debrid rate limit (opt-in retry)'
++          : 'debrid rate limit',
++        retryAfterMs: parseRetryAfterMs(error),
++      };
++    }
++
++    if (permanentResolveErrorCodes.has(error.code)) {
++      return {
++        retry: false,
++        reason: `permanent debrid error: ${error.code ?? 'UNKNOWN'}`,
++      };
++    }
++
++    if (transientResolveErrorCodes.has(error.code)) {
++      return {
++        retry: true,
++        reason: `transient debrid error: ${error.code}`,
++        retryAfterMs: parseRetryAfterMs(error),
++      };
++    }
++
++    if (
++      error.statusCode === 408 ||
++      error.statusCode === 425 ||
++      error.statusCode === 500 ||
++      error.statusCode === 502 ||
++      error.statusCode === 503 ||
++      error.statusCode === 504
++    ) {
++      return {
++        retry: true,
++        reason: `transient HTTP ${error.statusCode}`,
++        retryAfterMs: parseRetryAfterMs(error),
++      };
++    }
++
++    if (error.statusCode >= 400 && error.statusCode < 500) {
++      return {
++        retry: false,
++        reason: `non-retryable HTTP ${error.statusCode}`,
++      };
++    }
++
++    if (error.code === 'UNKNOWN' && resolveRetryConfig.retryUnknownErrors) {
++      return { retry: true, reason: 'unknown debrid resolve error' };
++    }
++
++    return { retry: false, reason: 'non-retryable debrid resolve error' };
++  }
++
++  const code = findErrorCode(error);
++  if (code && transientNetworkErrorCodes.has(code)) {
++    return { retry: true, reason: `transient network error: ${code}` };
++  }
++
++  const name =
++    error && typeof error === 'object' && 'name' in error
++      ? String((error as { name?: unknown }).name ?? '')
++      : '';
++  if (name === 'AbortError' || name === 'TimeoutError') {
++    return { retry: true, reason: name };
++  }
++
++  if (resolveRetryConfig.retryUnknownErrors) {
++    return { retry: true, reason: 'unknown resolve exception' };
++  }
++
++  return { retry: false, reason: 'unknown resolve exception' };
++};
++
++const getResolveRetryDelayMs = (
++  retryNumber: number,
++  retryAfterMs?: number
++): number => {
++  const exponentialDelay =
++    resolveRetryConfig.delayMs * Math.pow(2, Math.max(0, retryNumber - 1));
++  return Math.min(
++    resolveRetryConfig.maxDelayMs,
++    Math.max(exponentialDelay, retryAfterMs ?? 0)
++  );
++};
++
+ router.use(corsMiddleware);
+ 
+ // block HEAD requests
+@@ -157,6 +378,98 @@
+         req.userIp
+       );
+ 
++      const resolveWithRetry = async (
++        currentPlaybackInfo: PlaybackInfo,
++        currentFilename: string
++      ): Promise<string | undefined> => {
++        const totalAttempts = resolveRetryConfig.retries + 1;
++
++        for (let attempt = 1; attempt <= totalAttempts; attempt++) {
++          try {
++            const result = await debridInterface.resolve(
++              currentPlaybackInfo,
++              currentFilename,
++              fileInfo.cacheAndPlay ?? false,
++              fileInfo.autoRemoveDownloads
++            );
++
++            if (attempt > 1) {
++              logger.info(
++                result
++                  ? `[${storeAuth.id}] Debrid resolve retry succeeded`
++                  : `[${storeAuth.id}] Debrid resolve retry completed without a playback URL`,
++                {
++                  attempt,
++                  totalAttempts,
++                  playbackType: currentPlaybackInfo.type,
++                }
++              );
++            }
++
++            return result;
++          } catch (error: unknown) {
++            const decision = classifyResolveError(error);
++            const isLastAttempt = attempt >= totalAttempts;
++
++            if (!decision.retry || isLastAttempt || req.destroyed) {
++              if (attempt > 1 && isLastAttempt) {
++                logger.warn(
++                  `[${storeAuth.id}] Debrid resolve retries exhausted`,
++                  {
++                    attempts: attempt,
++                    playbackType: currentPlaybackInfo.type,
++                    reason: decision.reason,
++                    code:
++                      error instanceof DebridError
++                        ? error.code
++                        : findErrorCode(error),
++                    statusCode:
++                      error instanceof DebridError
++                        ? error.statusCode
++                        : undefined,
++                    message:
++                      error instanceof Error
++                        ? error.message
++                        : String(error),
++                  }
++                );
++              }
++              throw error;
++            }
++
++            const retryNumber = attempt;
++            const delayMs = getResolveRetryDelayMs(
++              retryNumber,
++              decision.retryAfterMs
++            );
++
++            logger.warn(
++              `[${storeAuth.id}] Debrid resolve failed temporarily; retrying`,
++              {
++                attempt,
++                nextAttempt: attempt + 1,
++                totalAttempts,
++                delayMs,
++                playbackType: currentPlaybackInfo.type,
++                reason: decision.reason,
++                code:
++                  error instanceof DebridError
++                    ? error.code
++                    : findErrorCode(error),
++                statusCode:
++                  error instanceof DebridError ? error.statusCode : undefined,
++                message:
++                  error instanceof Error ? error.message : String(error),
++              }
++            );
++
++            await sleep(delayMs);
++          }
++        }
++
++        return undefined;
++      };
++
+       const fbk = req.query.fbk as string | undefined;
+       const nzbFallbacks: NzbFallback[] = fbk ? await getNzbFallbacks(fbk) : [];
+ 
+@@ -196,11 +509,9 @@
+           const currentFilename = attempt?.filename ?? filename;
+ 
+           try {
+-            const url = await debridInterface.resolve(
++            const url = await resolveWithRetry(
+               currentPlaybackInfo,
+-              currentFilename,
+-              fileInfo.cacheAndPlay ?? false,
+-              fileInfo.autoRemoveDownloads
++              currentFilename
+             );
+             if (attempt !== null) {
+               logger.info(
+@@ -244,12 +555,7 @@
+           );
+           streamUrl = result;
+         } else {
+-          streamUrl = await debridInterface.resolve(
+-            playbackInfo,
+-            filename,
+-            fileInfo.cacheAndPlay ?? false,
+-            fileInfo.autoRemoveDownloads
+-          );
++          streamUrl = await resolveWithRetry(playbackInfo, filename);
+         }
+       } catch (err: any) {
+         resolveError = err;

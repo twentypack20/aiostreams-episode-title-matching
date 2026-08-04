@@ -5,6 +5,8 @@ Files changed
 -------------
 - packages/core/src/streams/filterer.ts
 - packages/core/src/main/resources.ts
+- packages/server/src/routes/api/debrid.ts
+- .env.sample
 
 Why the previous universal preflight failed
 -------------------------------------------
@@ -81,8 +83,50 @@ Deployment
    docker logs aiostreams --since 20m 2>&1 \
      | grep -Ei 'resolver preflight|preflight result'
 
-TypeScript compile fix
-----------------------
-The debug log now reads the ParsedStream fields that actually exist:
-  stream.originalName ?? stream.filename ?? stream.addon.name
-This fixes TS2339 at filterer.ts line 3921 (`stream.name` is not a ParsedStream field).
+Playback-time debrid resolution retry
+-------------------------------------
+The resolver preflight runs while the stream list is built. A separate failure
+can still happen after a user clicks an AIOStreams cloud/playback link: the
+playback route calls the configured debrid service and either redirects to the
+real media URL or redirects to an AIOStreams error video.
+
+This patch retries temporary failures inside the AIOStreams playback route
+before it returns that error video. It applies to links using:
+
+  /api/v1/debrid/playback/...
+
+It cannot change retry behavior inside a direct third-party resolver URL such
+as torrentio.strem.fun/resolve/....
+
+Default behavior:
+- 1 initial resolution attempt plus 2 retries.
+- Exponential delays of 750 ms and 1500 ms.
+- Retries transient server/network errors and unknown 5xx-style failures.
+- Does not retry permanent conditions such as legal blocks, invalid files,
+  authentication failures, payment/account limits, or no matching file.
+- Does not retry HTTP 429/rate limits by default, because repeated rejected
+  requests can worsen provider throttling.
+- Does not log encrypted credentials, resolver URLs, or final media URLs.
+
+Recommended docker-compose.yml environment
+------------------------------------------
+  DEBRID_RESOLVE_RETRIES: "2"
+  DEBRID_RESOLVE_RETRY_DELAY_MS: "750"
+  DEBRID_RESOLVE_RETRY_MAX_DELAY_MS: "4000"
+  DEBRID_RESOLVE_RETRY_ON_RATE_LIMIT: "false"
+  DEBRID_RESOLVE_RETRY_UNKNOWN_ERRORS: "true"
+
+DEBRID_RESOLVE_RETRIES counts retries after the initial attempt. Set it to 0 to
+turn playback-time retries off without rebuilding.
+
+Useful logs
+-----------
+  docker logs aiostreams --since 20m 2>&1 \
+    | grep -Ei 'debrid resolve.*retry|retries exhausted'
+
+A successful automatic recovery is logged as:
+
+  Debrid resolve retry succeeded
+
+AIOStreams will still return its normal error video if all allowed attempts
+fail or if the failure is classified as permanent.
