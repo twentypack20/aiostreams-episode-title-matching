@@ -20,7 +20,14 @@ import {
 } from '../db/index.js';
 import { createFormatter, FormatterContext } from '../formatters/index.js';
 import { AIOStreamsError, AIOStreamsResponse } from '../main/types.js';
-import { Cache, createLogger, getTimeTakenSincePoint } from '../utils/index.js';
+import {
+  Cache,
+  createLogger,
+  getTimeTakenSincePoint,
+  encryptString,
+  isSupportedExternalResolverUrl,
+  getExternalResolverProvider,
+} from '../utils/index.js';
 import { generateBingeGroup } from './utils.js';
 
 type ErrorOptions = {
@@ -66,11 +73,45 @@ export class StremioTransformer {
       ? undefined
       : generateBingeGroup(stream, index, this.userData);
 
+    let playbackUrl = stream.url;
+    if (
+      playbackUrl &&
+      isSupportedExternalResolverUrl(playbackUrl) &&
+      !/^(0|false|no|off)$/i.test(
+        process.env.EXTERNAL_RESOLVER_PLAYBACK_WRAPPER ?? 'true'
+      )
+    ) {
+      const expiresAt =
+        Date.now() +
+        Math.max(
+          60,
+          Number(appConfig.builtins.debrid.playbackLinkValidity) || 86_400
+        ) *
+          1000;
+      const encrypted = encryptString(
+        JSON.stringify({
+          version: 1,
+          url: playbackUrl,
+          expiresAt,
+        })
+      );
+
+      if (encrypted.success) {
+        playbackUrl = `${appConfig.bootstrap.baseUrl}/api/v1/debrid/external-resolver/${encrypted.data}/${encodeURIComponent(stream.filename ?? 'stream')}`;
+      } else {
+        logger.warn('Failed to wrap external resolver playback URL', {
+          provider: getExternalResolverProvider(playbackUrl) ?? 'unknown',
+          streamId: stream.id,
+          error: encrypted.error,
+        });
+      }
+    }
+
     return {
       name,
       description,
       url: ['http', 'usenet', 'debrid', 'live', 'info'].includes(stream.type)
-        ? stream.url
+        ? playbackUrl
         : undefined,
       infoHash: stream.type === 'p2p' ? stream.torrent?.infoHash : undefined,
       fileIdx: stream.type === 'p2p' ? stream.torrent?.fileIdx : undefined,

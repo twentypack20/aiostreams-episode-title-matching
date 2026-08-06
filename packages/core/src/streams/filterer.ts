@@ -7,6 +7,7 @@ import {
   constants,
   compileRegex,
   formRegexFromKeywords,
+  isKnownExternalResolverHopUrl,
 } from '../utils/index.js';
 import { LANGUAGES, StreamType } from '../utils/constants.js';
 import {
@@ -3390,16 +3391,16 @@ class StreamFilterer {
     return finalStreams;
   }
   /**
-   * Validate final anime resolver URLs after sorting, limiting, stream
-   * expression filtering, and fallback insertion. Resolver redirects are
-   * inspected without following the final debrid/CDN media URL, so error-video
-   * redirects can be removed without downloading media from the server IP.
+   * Validate final resolver URLs after sorting, limiting, stream-expression
+   * filtering, and fallback insertion. This applies to movies, series, and
+   * anime. Resolver redirects are inspected without following the final
+   * debrid/CDN media URL.
    */
   public async preflightPlaybackStreams(
     streams: ParsedStream[],
     context: StreamContext
   ): Promise<ParsedStream[]> {
-    const { id, isAnime } = context;
+    const { id } = context;
     const boolEnv = (value: string | undefined): boolean =>
       /^(1|true|yes|on)$/i.test(value ?? '');
     const numberEnv = (
@@ -3413,35 +3414,44 @@ class StreamFilterer {
       return Math.min(max, Math.max(min, Math.floor(parsed)));
     };
 
-    const enabled = boolEnv(process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK);
-    if (!isAnime || !enabled || streams.length === 0) return streams;
+    const enabled = boolEnv(
+      process.env.PLAYBACK_PREFLIGHT_CHECK ??
+        process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK
+    );
+    if (!enabled || streams.length === 0) return streams;
 
     // A limit of 0 means check every final playable stream. A positive value is
     // retained as an emergency cap for users with unusually large result lists.
     const configuredLimit = numberEnv(
-      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
+      process.env.PLAYBACK_PREFLIGHT_CHECK_LIMIT ??
+        process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
       0,
       0,
       100
     );
     const timeoutMs = numberEnv(
-      process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
+      process.env.PLAYBACK_PREFLIGHT_TIMEOUT_MS ??
+        process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
       7000,
       500,
       30000
     );
     const concurrency = numberEnv(
-      process.env.ANIME_PREFLIGHT_PLAYBACK_CONCURRENCY,
+      process.env.PLAYBACK_PREFLIGHT_CONCURRENCY ??
+        process.env.ANIME_PREFLIGHT_PLAYBACK_CONCURRENCY,
       3,
       1,
       10
     );
+    const hideLegalEnv =
+      process.env.PLAYBACK_HIDE_LEGAL_UNAVAILABLE ??
+      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE;
     const hideLegalUnavailable =
-      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE === undefined
-        ? true
-        : boolEnv(process.env.ANIME_HIDE_LEGAL_UNAVAILABLE);
+      hideLegalEnv === undefined ? true : boolEnv(hideLegalEnv);
     const inconclusiveMode = (
-      process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE || 'keep'
+      process.env.PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE ??
+      process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE ??
+      'keep'
     ).toLowerCase();
 
     type PreflightStatus = 'passed' | 'failed' | 'inconclusive';
@@ -3589,7 +3599,8 @@ class StreamFilterer {
       contentType.includes('problem+json');
 
     const isResolverUrl = (url: string): boolean =>
-      /\/api\/v1\/debrid\/playback\/|\/resolve\//i.test(url);
+      /\/api\/v1\/debrid\/(?:playback|external-resolver)\//i.test(url) ||
+      isKnownExternalResolverHopUrl(url);
 
     const classifyRedirectTarget = (
       sourceUrl: string,
@@ -3915,7 +3926,7 @@ class StreamFilterer {
         try {
           host = new URL(url).host;
         } catch {}
-        logger.debug('Anime resolver preflight result', {
+        logger.debug('Resolver preflight result', {
           id,
           streamId: stream.id,
           streamName: stream.originalName ?? stream.filename ?? stream.addon.name,
@@ -3947,7 +3958,7 @@ class StreamFilterer {
       }
     }
 
-    logger.info('Completed final anime resolver preflight', {
+    logger.info('Completed final resolver preflight', {
       id,
       checked: candidates.length,
       passed:

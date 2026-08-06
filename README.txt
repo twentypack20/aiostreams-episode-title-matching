@@ -1,10 +1,13 @@
-AIOStreams safe anime resolver preflight patch
+AIOStreams safe resolver preflight and playback retry patch
 ==============================================
 
 Files changed
 -------------
 - packages/core/src/streams/filterer.ts
 - packages/core/src/main/resources.ts
+- packages/core/src/transformers/stremio.ts
+- packages/core/src/utils/external-resolver.ts
+- packages/core/src/utils/index.ts
 - packages/server/src/routes/api/debrid.ts
 - .env.sample
 
@@ -24,7 +27,7 @@ final media response. That had two serious problems:
 
 What this version does
 ----------------------
-- Checks all final HTTP(S) anime results when CHECK_LIMIT is 0.
+- Checks final HTTP(S) results for movies, series, and anime when CHECK_LIMIT is 0.
 - Uses redirect: manual for AIOStreams and Torrentio resolver routes.
 - Detects AIOStreams static error-video redirects before they are followed.
 - Follows only resolver-to-resolver hops.
@@ -95,8 +98,9 @@ before it returns that error video. It applies to links using:
 
   /api/v1/debrid/playback/...
 
-It cannot change retry behavior inside a direct third-party resolver URL such
-as torrentio.strem.fun/resolve/....
+Direct Torrentio resolver URLs are now wrapped by AIOStreams at response
+formatting time, so the same retry policy can cover Torrentio-to-TorBox and
+Torrentio-to-Real-Debrid playback routes as well.
 
 Default behavior:
 - 1 initial resolution attempt plus 2 retries.
@@ -130,3 +134,42 @@ A successful automatic recovery is logged as:
 
 AIOStreams will still return its normal error video if all allowed attempts
 fail or if the failure is classified as permanent.
+
+External Torrentio resolver playback wrapper
+---------------------------------------------
+Direct Torrentio resolver links previously bypassed AIOStreams after they were
+returned to Stremio, so DEBRID_RESOLVE_RETRIES could not help them. This update
+wraps supported Torrentio /resolve/... URLs in an encrypted local endpoint:
+
+  /api/v1/debrid/external-resolver/...
+
+At playback time AIOStreams now follows only known resolver/API hops, retries
+transient failures using the existing DEBRID_RESOLVE_* settings, and redirects
+Stremio to the final CDN/media URL without downloading the video on the VPS.
+If all server-side attempts fail for a temporary reason, it redirects to the
+original Torrentio URL for one final client-side attempt. Permanent resolver
+errors use the usual AIOStreams error clip.
+
+The wrapper is enabled by default. Optional settings:
+
+  EXTERNAL_RESOLVER_PLAYBACK_WRAPPER: "true"
+  EXTERNAL_RESOLVER_TIMEOUT_MS: "10000"
+  EXTERNAL_RESOLVER_MAX_HOPS: "5"
+  EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL: "true"
+
+The initial URL is restricted to an allowlisted Torrentio host/path, and only
+known resolver API hosts are followed. Final media/CDN hosts are never fetched
+by AIOStreams; they are handed back to Stremio.
+
+Universal preflight aliases
+---------------------------
+The final resolver preflight now applies to movies and ordinary series as well
+as anime. Existing ANIME_PREFLIGHT_* variables still work. New generic aliases
+are also accepted and take priority when both are set:
+
+  PLAYBACK_PREFLIGHT_CHECK
+  PLAYBACK_PREFLIGHT_CHECK_LIMIT
+  PLAYBACK_PREFLIGHT_TIMEOUT_MS
+  PLAYBACK_PREFLIGHT_CONCURRENCY
+  PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE
+  PLAYBACK_HIDE_LEGAL_UNAVAILABLE

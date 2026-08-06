@@ -30,3 +30,5 @@ export * from './nzb-proxy.js';
 export * from './time.js';
 export * from './fieldMeta.js';
 export { config as appConfig } from '../config/index.js';
+
+export * from './external-resolver.js';

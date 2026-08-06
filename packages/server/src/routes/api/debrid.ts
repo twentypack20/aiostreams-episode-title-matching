@@ -24,8 +24,11 @@ import {
   isNzbRetryableError,
   DistributedLock,
   type NzbFallback,
+  isSupportedExternalResolverUrl,
+  isKnownExternalResolverHopUrl,
+  getExternalResolverProvider,
 } from '@aiostreams/core';
-import { ZodError } from 'zod';
+import { z, ZodError } from 'zod';
 import { StaticFiles } from '../../app.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
 const router: Router = Router();
@@ -252,6 +255,370 @@ const getResolveRetryDelayMs = (
   );
 };
 
+const ExternalResolverPayloadSchema = z.object({
+  version: z.literal(1),
+  url: z.string().url(),
+  expiresAt: z.number().int().positive(),
+});
+
+type ExternalResolverPayload = {
+  version: 1;
+  url: string;
+  expiresAt: number;
+};
+
+class ExternalResolverError extends Error {
+  constructor(
+    message: string,
+    public readonly retryable: boolean,
+    public readonly statusCode?: number,
+    public readonly retryAfterMs?: number
+  ) {
+    super(message);
+    this.name = 'ExternalResolverError';
+  }
+}
+
+const externalResolverConfig = {
+  timeoutMs: parseIntegerEnv(
+    process.env.EXTERNAL_RESOLVER_TIMEOUT_MS,
+    10_000,
+    1_000,
+    60_000
+  ),
+  maxHops: parseIntegerEnv(
+    process.env.EXTERNAL_RESOLVER_MAX_HOPS,
+    5,
+    1,
+    10
+  ),
+  fallbackToOriginal: parseBooleanEnv(
+    process.env.EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL,
+    true
+  ),
+};
+
+const parseResponseRetryAfterMs = (
+  response: Awaited<ReturnType<typeof fetch>>
+): number | undefined => {
+  const value = response.headers.get('retry-after');
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.floor(seconds * 1000);
+  }
+  const retryAt = Date.parse(value);
+  return Number.isFinite(retryAt)
+    ? Math.max(0, retryAt - Date.now())
+    : undefined;
+};
+
+const cancelFetchBody = async (
+  response: Awaited<ReturnType<typeof fetch>>
+): Promise<void> => {
+  try {
+    await response.body?.cancel();
+  } catch {}
+};
+
+const readFetchBodySnippet = async (
+  response: Awaited<ReturnType<typeof fetch>>,
+  maxBytes: number = 64 * 1024
+): Promise<string> => {
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+      const remaining = maxBytes - total;
+      const chunk = value.length > remaining ? value.slice(0, remaining) : value;
+      chunks.push(chunk);
+      total += chunk.length;
+      if (value.length > remaining) break;
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+  }
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new TextDecoder('utf-8', { fatal: false }).decode(combined).trim();
+};
+
+const findNestedResolverUrl = (
+  value: unknown,
+  depth: number = 0
+): string | undefined => {
+  if (depth > 5 || value === null || value === undefined) return undefined;
+  if (typeof value === 'string') {
+    const trimmed = value.trim().replace(/^['"]|['"]$/g, '');
+    return /^https?:\/\/\S+$/i.test(trimmed) ? trimmed : undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findNestedResolverUrl(item, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    for (const key of ['download', 'url', 'stream', 'location']) {
+      if (!(key in object)) continue;
+      const found = findNestedResolverUrl(object[key], depth + 1);
+      if (found) return found;
+    }
+    for (const [key, nested] of Object.entries(object)) {
+      if (['download', 'url', 'stream', 'location'].includes(key)) continue;
+      const found = findNestedResolverUrl(nested, depth + 1);
+      if (found) return found;
+    }
+  }
+  return undefined;
+};
+
+const getExternalResolverJsonError = (value: unknown): string | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const object = value as Record<string, unknown>;
+  if (object.success === false) {
+    return String(object.message ?? object.error ?? 'resolver reported success=false');
+  }
+  for (const key of ['error', 'errors']) {
+    const error = object[key];
+    if (
+      error !== undefined &&
+      error !== null &&
+      error !== false &&
+      error !== '' &&
+      !(Array.isArray(error) && error.length === 0)
+    ) {
+      return typeof error === 'string' ? error : JSON.stringify(error);
+    }
+  }
+  return undefined;
+};
+
+const resolverErrorBodyPattern =
+  /unavailable for legal reasons|legal reasons|try a different file|not available|unavailable|file not found|torrent not found|no (?:stream|link|file)s? found|invalid (?:torrent|magnet|link|file)|forbidden|access denied|permission denied|blocked|expired|not cached|uncached|resolver (?:error|failed)|playback (?:error|failed)|failed to (?:resolve|fetch|play)|could not (?:resolve|fetch|play)/i;
+
+const parseHttpTarget = (value: string, base: string): string => {
+  let target: URL;
+  try {
+    target = new URL(value, base);
+  } catch {
+    throw new ExternalResolverError(
+      'External resolver returned an invalid URL',
+      false
+    );
+  }
+  if (!['http:', 'https:'].includes(target.protocol)) {
+    throw new ExternalResolverError(
+      'External resolver returned an unsupported URL protocol',
+      false
+    );
+  }
+  return target.toString();
+};
+
+const resolveExternalResolverChain = async (
+  sourceUrl: string,
+  signal: AbortSignal,
+  clientIp?: string
+): Promise<string> => {
+  let currentUrl = sourceUrl;
+
+  for (let hop = 0; hop <= externalResolverConfig.maxHops; hop++) {
+    const response = await fetch(currentUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      signal,
+      headers: {
+        Accept:
+          'video/*, audio/*, application/octet-stream, application/json, text/plain, */*;q=0.5',
+        'User-Agent': 'AIOStreams external resolver playback',
+        ...(clientIp
+          ? {
+              'X-Forwarded-For': clientIp,
+              'X-Real-IP': clientIp,
+            }
+          : {}),
+      },
+    });
+
+    const status = response.status;
+    const contentType =
+      response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() ?? '';
+
+    if (status >= 300 && status < 400) {
+      const location = response.headers.get('location');
+      await cancelFetchBody(response);
+      if (!location) {
+        throw new ExternalResolverError(
+          `External resolver returned HTTP ${status} without Location`,
+          true,
+          status
+        );
+      }
+      const targetUrl = parseHttpTarget(location, currentUrl);
+      if (isKnownExternalResolverHopUrl(targetUrl)) {
+        currentUrl = targetUrl;
+        continue;
+      }
+      return targetUrl;
+    }
+
+    if ([408, 425, 500, 502, 503, 504].includes(status)) {
+      const retryAfterMs = parseResponseRetryAfterMs(response);
+      await cancelFetchBody(response);
+      throw new ExternalResolverError(
+        `External resolver returned transient HTTP ${status}`,
+        true,
+        status,
+        retryAfterMs
+      );
+    }
+
+    if (status === 429) {
+      const retryAfterMs = parseResponseRetryAfterMs(response);
+      await cancelFetchBody(response);
+      throw new ExternalResolverError(
+        'External resolver was rate limited',
+        resolveRetryConfig.retryRateLimits,
+        status,
+        retryAfterMs
+      );
+    }
+
+    if (status >= 400) {
+      const body = await readFetchBodySnippet(response, 8 * 1024);
+      throw new ExternalResolverError(
+        `External resolver returned HTTP ${status}${body ? `: ${body.slice(0, 180)}` : ''}`,
+        false,
+        status
+      );
+    }
+
+    if (status === 204) {
+      await cancelFetchBody(response);
+      throw new ExternalResolverError(
+        'External resolver returned an empty response',
+        true,
+        status
+      );
+    }
+
+    if (
+      /^(video|audio)\//.test(contentType) ||
+      /application\/(?:octet-stream|x-matroska|mp4|vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)/.test(
+        contentType
+      )
+    ) {
+      await cancelFetchBody(response);
+      return currentUrl;
+    }
+
+    if (
+      contentType.includes('text/') ||
+      contentType.includes('json') ||
+      contentType.includes('html') ||
+      contentType.includes('problem+json') ||
+      contentType === ''
+    ) {
+      const body = await readFetchBodySnippet(response);
+      let parsedJson: unknown;
+      if (contentType.includes('json') || /^[\[{]/.test(body)) {
+        try {
+          parsedJson = JSON.parse(body);
+        } catch {}
+      }
+      if (parsedJson !== undefined) {
+        const jsonError = getExternalResolverJsonError(parsedJson);
+        if (jsonError) {
+          throw new ExternalResolverError(
+            `External resolver error: ${jsonError.slice(0, 180)}`,
+            false,
+            status
+          );
+        }
+        const nested = findNestedResolverUrl(parsedJson);
+        if (nested) {
+          const targetUrl = parseHttpTarget(nested, currentUrl);
+          if (isKnownExternalResolverHopUrl(targetUrl)) {
+            currentUrl = targetUrl;
+            continue;
+          }
+          return targetUrl;
+        }
+      }
+      const plainUrl = /^https?:\/\/\S+$/i.test(body) ? body : undefined;
+      if (plainUrl) {
+        const targetUrl = parseHttpTarget(plainUrl, currentUrl);
+        if (isKnownExternalResolverHopUrl(targetUrl)) {
+          currentUrl = targetUrl;
+          continue;
+        }
+        return targetUrl;
+      }
+      if (resolverErrorBodyPattern.test(body)) {
+        throw new ExternalResolverError(
+          `External resolver returned an error response: ${body.slice(0, 180)}`,
+          false,
+          status
+        );
+      }
+      throw new ExternalResolverError(
+        `External resolver returned unexpected ${contentType || 'text'} content`,
+        true,
+        status
+      );
+    }
+
+    await cancelFetchBody(response);
+    return currentUrl;
+  }
+
+  throw new ExternalResolverError(
+    'External resolver returned too many resolver hops',
+    false
+  );
+};
+
+const classifyExternalResolverException = (
+  error: unknown
+): ResolveRetryDecision => {
+  if (error instanceof ExternalResolverError) {
+    return {
+      retry: error.retryable,
+      reason: error.message,
+      retryAfterMs: error.retryAfterMs,
+    };
+  }
+  const code = findErrorCode(error);
+  if (code && transientNetworkErrorCodes.has(code)) {
+    return { retry: true, reason: `transient network error: ${code}` };
+  }
+  const name =
+    error && typeof error === 'object' && 'name' in error
+      ? String((error as { name?: unknown }).name ?? '')
+      : '';
+  if (name === 'AbortError' || name === 'TimeoutError') {
+    return { retry: true, reason: name };
+  }
+  return {
+    retry: resolveRetryConfig.retryUnknownErrors,
+    reason: 'unknown external resolver error',
+  };
+};
+
 router.use(corsMiddleware);
 
 // block HEAD requests
@@ -262,6 +629,170 @@ router.use((req: Request, res: Response, next: NextFunction) => {
     next();
   }
 });
+
+interface ExternalResolverParams {
+  encryptedResolver: string;
+  filename: string;
+}
+
+router.get(
+  '/external-resolver/:encryptedResolver/:filename',
+  async (
+    req: Request<ExternalResolverParams>,
+    res: Response,
+    next: NextFunction
+  ) => {
+    let payload: ExternalResolverPayload | undefined;
+    let lastError: unknown;
+    let lastDecision: ResolveRetryDecision | undefined;
+
+    try {
+      const decrypted = decryptString(req.params.encryptedResolver);
+      if (!decrypted.success) {
+        throw new APIError(
+          constants.ErrorCode.BAD_REQUEST,
+          undefined,
+          'Failed to decrypt external resolver URL'
+        );
+      }
+
+      try {
+        payload = ExternalResolverPayloadSchema.parse(
+          JSON.parse(decrypted.data)
+        ) as ExternalResolverPayload;
+      } catch (error) {
+        throw new APIError(
+          constants.ErrorCode.BAD_REQUEST,
+          undefined,
+          error instanceof ZodError
+            ? formatZodError(error)
+            : 'Failed to parse external resolver payload'
+        );
+      }
+
+      if (payload.expiresAt < Date.now()) {
+        throw new APIError(
+          constants.ErrorCode.BAD_REQUEST,
+          undefined,
+          'External resolver playback link has expired'
+        );
+      }
+
+      if (!isSupportedExternalResolverUrl(payload.url)) {
+        throw new APIError(
+          constants.ErrorCode.BAD_REQUEST,
+          undefined,
+          'Unsupported external resolver URL'
+        );
+      }
+
+      const provider = getExternalResolverProvider(payload.url) ?? 'unknown';
+      const totalAttempts = resolveRetryConfig.retries + 1;
+
+      for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          externalResolverConfig.timeoutMs
+        );
+
+        try {
+          const finalUrl = await resolveExternalResolverChain(
+            payload.url,
+            controller.signal,
+            req.userIp
+          );
+          clearTimeout(timeout);
+
+          if (attempt > 1) {
+            logger.info('External resolver retry succeeded', {
+              provider,
+              attempt,
+              totalAttempts,
+            });
+          }
+
+          res.redirect(307, finalUrl);
+          return;
+        } catch (error) {
+          clearTimeout(timeout);
+          lastError = error;
+          lastDecision = classifyExternalResolverException(error);
+          const isLastAttempt = attempt >= totalAttempts;
+
+          if (!lastDecision.retry || isLastAttempt || req.destroyed) {
+            break;
+          }
+
+          const delayMs = getResolveRetryDelayMs(
+            attempt,
+            lastDecision.retryAfterMs
+          );
+          logger.warn('External resolver failed temporarily; retrying', {
+            provider,
+            attempt,
+            nextAttempt: attempt + 1,
+            totalAttempts,
+            delayMs,
+            reason: lastDecision.reason,
+          });
+          await sleep(delayMs);
+        }
+      }
+
+      logger.warn('External resolver retries exhausted', {
+        provider,
+        attempts: resolveRetryConfig.retries + 1,
+        reason: lastDecision?.reason,
+        message:
+          lastError instanceof Error ? lastError.message : String(lastError),
+      });
+
+      // A final client-side attempt is useful when the server/VPS route had a
+      // transient DNS, TLS, or CDN problem that may not affect the Stremio
+      // device. Permanent resolver failures still use an AIOStreams error clip.
+      if (
+        lastDecision?.retry &&
+        externalResolverConfig.fallbackToOriginal
+      ) {
+        res.redirect(307, payload.url);
+        return;
+      }
+
+      let staticFile: string = StaticFiles.INTERNAL_SERVER_ERROR;
+      const statusCode =
+        lastError instanceof ExternalResolverError
+          ? lastError.statusCode
+          : undefined;
+      if (statusCode === 401) staticFile = StaticFiles.UNAUTHORIZED;
+      else if (statusCode === 403) staticFile = StaticFiles.FORBIDDEN;
+      else if (statusCode === 429) staticFile = StaticFiles.TOO_MANY_REQUESTS;
+      else if (statusCode === 451) {
+        staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
+      }
+
+      res.redirect(307, `/static/${staticFile}`);
+    } catch (error) {
+      if (error instanceof APIError || error instanceof ZodError) {
+        next(error);
+        return;
+      }
+      logger.error(
+        { err: error },
+        `got unexpected error during external resolver playback: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      next(
+        new APIError(
+          constants.ErrorCode.INTERNAL_SERVER_ERROR,
+          undefined,
+          error instanceof Error ? error.message : String(error)
+        )
+      );
+    }
+  }
+);
 
 interface PlaybackParams {
   encryptedStoreAuth: string;

@@ -1,0 +1,862 @@
+diff --git a/.env.sample b/.env.sample
+index 53d0fc0..0129768 100644
+--- a/.env.sample
++++ b/.env.sample
+@@ -158,3 +158,22 @@ DATABASE_URI=sqlite://./data/db.sqlite
+ # errors (legal, auth, account/payment, invalid file, no matching file) are
+ # never retried regardless of this setting.
+ # DEBRID_RESOLVE_RETRY_UNKNOWN_ERRORS=true
++
++# Universal final playback preflight. PLAYBACK_* names are preferred; the
++# older ANIME_* aliases remain supported for backwards compatibility.
++PLAYBACK_PREFLIGHT_CHECK=false
++PLAYBACK_PREFLIGHT_CHECK_LIMIT=0
++PLAYBACK_PREFLIGHT_TIMEOUT_MS=7000
++PLAYBACK_PREFLIGHT_CONCURRENCY=3
++PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE=keep
++PLAYBACK_HIDE_LEGAL_UNAVAILABLE=true
++
++# Wrap supported third-party resolver URLs (currently Torrentio) in a local
++# AIOStreams playback endpoint so temporary resolver failures can be retried.
++EXTERNAL_RESOLVER_PLAYBACK_WRAPPER=true
++EXTERNAL_RESOLVER_TIMEOUT_MS=10000
++EXTERNAL_RESOLVER_MAX_HOPS=5
++EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL=true
++# Optional comma-separated overrides; normally leave these unset.
++# EXTERNAL_RESOLVER_INITIAL_HOSTS=torrentio.strem.fun
++# EXTERNAL_RESOLVER_HOP_HOSTS=torrentio.strem.fun,api.torbox.app,api.real-debrid.com
+diff --git a/README.txt b/README.txt
+index 376b14b..31728f2 100644
+--- a/README.txt
++++ b/README.txt
+@@ -1,10 +1,13 @@
+-AIOStreams safe anime resolver preflight patch
++AIOStreams safe resolver preflight and playback retry patch
+ ==============================================
+ 
+ Files changed
+ -------------
+ - packages/core/src/streams/filterer.ts
+ - packages/core/src/main/resources.ts
++- packages/core/src/transformers/stremio.ts
++- packages/core/src/utils/external-resolver.ts
++- packages/core/src/utils/index.ts
+ - packages/server/src/routes/api/debrid.ts
+ - .env.sample
+ 
+@@ -24,7 +27,7 @@ final media response. That had two serious problems:
+ 
+ What this version does
+ ----------------------
+-- Checks all final HTTP(S) anime results when CHECK_LIMIT is 0.
++- Checks final HTTP(S) results for movies, series, and anime when CHECK_LIMIT is 0.
+ - Uses redirect: manual for AIOStreams and Torrentio resolver routes.
+ - Detects AIOStreams static error-video redirects before they are followed.
+ - Follows only resolver-to-resolver hops.
+@@ -95,8 +98,9 @@ before it returns that error video. It applies to links using:
+ 
+   /api/v1/debrid/playback/...
+ 
+-It cannot change retry behavior inside a direct third-party resolver URL such
+-as torrentio.strem.fun/resolve/....
++Direct Torrentio resolver URLs are now wrapped by AIOStreams at response
++formatting time, so the same retry policy can cover Torrentio-to-TorBox and
++Torrentio-to-Real-Debrid playback routes as well.
+ 
+ Default behavior:
+ - 1 initial resolution attempt plus 2 retries.
+@@ -130,3 +134,42 @@ A successful automatic recovery is logged as:
+ 
+ AIOStreams will still return its normal error video if all allowed attempts
+ fail or if the failure is classified as permanent.
++
++External Torrentio resolver playback wrapper
++---------------------------------------------
++Direct Torrentio resolver links previously bypassed AIOStreams after they were
++returned to Stremio, so DEBRID_RESOLVE_RETRIES could not help them. This update
++wraps supported Torrentio /resolve/... URLs in an encrypted local endpoint:
++
++  /api/v1/debrid/external-resolver/...
++
++At playback time AIOStreams now follows only known resolver/API hops, retries
++transient failures using the existing DEBRID_RESOLVE_* settings, and redirects
++Stremio to the final CDN/media URL without downloading the video on the VPS.
++If all server-side attempts fail for a temporary reason, it redirects to the
++original Torrentio URL for one final client-side attempt. Permanent resolver
++errors use the usual AIOStreams error clip.
++
++The wrapper is enabled by default. Optional settings:
++
++  EXTERNAL_RESOLVER_PLAYBACK_WRAPPER: "true"
++  EXTERNAL_RESOLVER_TIMEOUT_MS: "10000"
++  EXTERNAL_RESOLVER_MAX_HOPS: "5"
++  EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL: "true"
++
++The initial URL is restricted to an allowlisted Torrentio host/path, and only
++known resolver API hosts are followed. Final media/CDN hosts are never fetched
++by AIOStreams; they are handed back to Stremio.
++
++Universal preflight aliases
++---------------------------
++The final resolver preflight now applies to movies and ordinary series as well
++as anime. Existing ANIME_PREFLIGHT_* variables still work. New generic aliases
++are also accepted and take priority when both are set:
++
++  PLAYBACK_PREFLIGHT_CHECK
++  PLAYBACK_PREFLIGHT_CHECK_LIMIT
++  PLAYBACK_PREFLIGHT_TIMEOUT_MS
++  PLAYBACK_PREFLIGHT_CONCURRENCY
++  PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE
++  PLAYBACK_HIDE_LEGAL_UNAVAILABLE
+diff --git a/packages/core/src/streams/filterer.ts b/packages/core/src/streams/filterer.ts
+index 8fcda6e..f02883d 100644
+--- a/packages/core/src/streams/filterer.ts
++++ b/packages/core/src/streams/filterer.ts
+@@ -7,6 +7,7 @@ import {
+   constants,
+   compileRegex,
+   formRegexFromKeywords,
++  isKnownExternalResolverHopUrl,
+ } from '../utils/index.js';
+ import { LANGUAGES, StreamType } from '../utils/constants.js';
+ import {
+@@ -3390,16 +3391,16 @@ class StreamFilterer {
+     return finalStreams;
+   }
+   /**
+-   * Validate final anime resolver URLs after sorting, limiting, stream
+-   * expression filtering, and fallback insertion. Resolver redirects are
+-   * inspected without following the final debrid/CDN media URL, so error-video
+-   * redirects can be removed without downloading media from the server IP.
++   * Validate final resolver URLs after sorting, limiting, stream-expression
++   * filtering, and fallback insertion. This applies to movies, series, and
++   * anime. Resolver redirects are inspected without following the final
++   * debrid/CDN media URL.
+    */
+   public async preflightPlaybackStreams(
+     streams: ParsedStream[],
+     context: StreamContext
+   ): Promise<ParsedStream[]> {
+-    const { id, isAnime } = context;
++    const { id } = context;
+     const boolEnv = (value: string | undefined): boolean =>
+       /^(1|true|yes|on)$/i.test(value ?? '');
+     const numberEnv = (
+@@ -3413,35 +3414,44 @@ class StreamFilterer {
+       return Math.min(max, Math.max(min, Math.floor(parsed)));
+     };
+ 
+-    const enabled = boolEnv(process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK);
+-    if (!isAnime || !enabled || streams.length === 0) return streams;
++    const enabled = boolEnv(
++      process.env.PLAYBACK_PREFLIGHT_CHECK ??
++        process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK
++    );
++    if (!enabled || streams.length === 0) return streams;
+ 
+     // A limit of 0 means check every final playable stream. A positive value is
+     // retained as an emergency cap for users with unusually large result lists.
+     const configuredLimit = numberEnv(
+-      process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
++      process.env.PLAYBACK_PREFLIGHT_CHECK_LIMIT ??
++        process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK_LIMIT,
+       0,
+       0,
+       100
+     );
+     const timeoutMs = numberEnv(
+-      process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
++      process.env.PLAYBACK_PREFLIGHT_TIMEOUT_MS ??
++        process.env.ANIME_PREFLIGHT_PLAYBACK_TIMEOUT_MS,
+       7000,
+       500,
+       30000
+     );
+     const concurrency = numberEnv(
+-      process.env.ANIME_PREFLIGHT_PLAYBACK_CONCURRENCY,
++      process.env.PLAYBACK_PREFLIGHT_CONCURRENCY ??
++        process.env.ANIME_PREFLIGHT_PLAYBACK_CONCURRENCY,
+       3,
+       1,
+       10
+     );
++    const hideLegalEnv =
++      process.env.PLAYBACK_HIDE_LEGAL_UNAVAILABLE ??
++      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE;
+     const hideLegalUnavailable =
+-      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE === undefined
+-        ? true
+-        : boolEnv(process.env.ANIME_HIDE_LEGAL_UNAVAILABLE);
++      hideLegalEnv === undefined ? true : boolEnv(hideLegalEnv);
+     const inconclusiveMode = (
+-      process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE || 'keep'
++      process.env.PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE ??
++      process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE ??
++      'keep'
+     ).toLowerCase();
+ 
+     type PreflightStatus = 'passed' | 'failed' | 'inconclusive';
+@@ -3589,7 +3599,8 @@ class StreamFilterer {
+       contentType.includes('problem+json');
+ 
+     const isResolverUrl = (url: string): boolean =>
+-      /\/api\/v1\/debrid\/playback\/|\/resolve\//i.test(url);
++      /\/api\/v1\/debrid\/(?:playback|external-resolver)\//i.test(url) ||
++      isKnownExternalResolverHopUrl(url);
+ 
+     const classifyRedirectTarget = (
+       sourceUrl: string,
+@@ -3915,7 +3926,7 @@ class StreamFilterer {
+         try {
+           host = new URL(url).host;
+         } catch {}
+-        logger.debug('Anime resolver preflight result', {
++        logger.debug('Resolver preflight result', {
+           id,
+           streamId: stream.id,
+           streamName: stream.originalName ?? stream.filename ?? stream.addon.name,
+@@ -3947,7 +3958,7 @@ class StreamFilterer {
+       }
+     }
+ 
+-    logger.info('Completed final anime resolver preflight', {
++    logger.info('Completed final resolver preflight', {
+       id,
+       checked: candidates.length,
+       passed:
+diff --git a/packages/core/src/transformers/stremio.ts b/packages/core/src/transformers/stremio.ts
+index 2b55166..9995299 100644
+--- a/packages/core/src/transformers/stremio.ts
++++ b/packages/core/src/transformers/stremio.ts
+@@ -20,7 +20,14 @@ import {
+ } from '../db/index.js';
+ import { createFormatter, FormatterContext } from '../formatters/index.js';
+ import { AIOStreamsError, AIOStreamsResponse } from '../main/types.js';
+-import { Cache, createLogger, getTimeTakenSincePoint } from '../utils/index.js';
++import {
++  Cache,
++  createLogger,
++  getTimeTakenSincePoint,
++  encryptString,
++  isSupportedExternalResolverUrl,
++  getExternalResolverProvider,
++} from '../utils/index.js';
+ import { generateBingeGroup } from './utils.js';
+ 
+ type ErrorOptions = {
+@@ -66,11 +73,45 @@ export class StremioTransformer {
+       ? undefined
+       : generateBingeGroup(stream, index, this.userData);
+ 
++    let playbackUrl = stream.url;
++    if (
++      playbackUrl &&
++      isSupportedExternalResolverUrl(playbackUrl) &&
++      !/^(0|false|no|off)$/i.test(
++        process.env.EXTERNAL_RESOLVER_PLAYBACK_WRAPPER ?? 'true'
++      )
++    ) {
++      const expiresAt =
++        Date.now() +
++        Math.max(
++          60,
++          Number(appConfig.builtins.debrid.playbackLinkValidity) || 86_400
++        ) *
++          1000;
++      const encrypted = encryptString(
++        JSON.stringify({
++          version: 1,
++          url: playbackUrl,
++          expiresAt,
++        })
++      );
++
++      if (encrypted.success) {
++        playbackUrl = `${appConfig.bootstrap.baseUrl}/api/v1/debrid/external-resolver/${encrypted.data}/${encodeURIComponent(stream.filename ?? 'stream')}`;
++      } else {
++        logger.warn('Failed to wrap external resolver playback URL', {
++          provider: getExternalResolverProvider(playbackUrl) ?? 'unknown',
++          streamId: stream.id,
++          error: encrypted.error,
++        });
++      }
++    }
++
+     return {
+       name,
+       description,
+       url: ['http', 'usenet', 'debrid', 'live', 'info'].includes(stream.type)
+-        ? stream.url
++        ? playbackUrl
+         : undefined,
+       infoHash: stream.type === 'p2p' ? stream.torrent?.infoHash : undefined,
+       fileIdx: stream.type === 'p2p' ? stream.torrent?.fileIdx : undefined,
+diff --git a/packages/core/src/utils/index.ts b/packages/core/src/utils/index.ts
+index caef4e3..308f6d4 100644
+--- a/packages/core/src/utils/index.ts
++++ b/packages/core/src/utils/index.ts
+@@ -30,3 +30,5 @@ export * from './nzb-proxy.js';
+ export * from './time.js';
+ export * from './fieldMeta.js';
+ export { config as appConfig } from '../config/index.js';
++
++export * from './external-resolver.js';
+diff --git a/packages/server/src/routes/api/debrid.ts b/packages/server/src/routes/api/debrid.ts
+index e005d1b..183a8d1 100644
+--- a/packages/server/src/routes/api/debrid.ts
++++ b/packages/server/src/routes/api/debrid.ts
+@@ -24,8 +24,11 @@ import {
+   isNzbRetryableError,
+   DistributedLock,
+   type NzbFallback,
++  isSupportedExternalResolverUrl,
++  isKnownExternalResolverHopUrl,
++  getExternalResolverProvider,
+ } from '@aiostreams/core';
+-import { ZodError } from 'zod';
++import { z, ZodError } from 'zod';
+ import { StaticFiles } from '../../app.js';
+ import { corsMiddleware } from '../../middlewares/cors.js';
+ const router: Router = Router();
+@@ -252,6 +255,370 @@ const getResolveRetryDelayMs = (
+   );
+ };
+ 
++const ExternalResolverPayloadSchema = z.object({
++  version: z.literal(1),
++  url: z.string().url(),
++  expiresAt: z.number().int().positive(),
++});
++
++type ExternalResolverPayload = {
++  version: 1;
++  url: string;
++  expiresAt: number;
++};
++
++class ExternalResolverError extends Error {
++  constructor(
++    message: string,
++    public readonly retryable: boolean,
++    public readonly statusCode?: number,
++    public readonly retryAfterMs?: number
++  ) {
++    super(message);
++    this.name = 'ExternalResolverError';
++  }
++}
++
++const externalResolverConfig = {
++  timeoutMs: parseIntegerEnv(
++    process.env.EXTERNAL_RESOLVER_TIMEOUT_MS,
++    10_000,
++    1_000,
++    60_000
++  ),
++  maxHops: parseIntegerEnv(
++    process.env.EXTERNAL_RESOLVER_MAX_HOPS,
++    5,
++    1,
++    10
++  ),
++  fallbackToOriginal: parseBooleanEnv(
++    process.env.EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL,
++    true
++  ),
++};
++
++const parseResponseRetryAfterMs = (
++  response: Awaited<ReturnType<typeof fetch>>
++): number | undefined => {
++  const value = response.headers.get('retry-after');
++  if (!value) return undefined;
++  const seconds = Number(value);
++  if (Number.isFinite(seconds) && seconds >= 0) {
++    return Math.floor(seconds * 1000);
++  }
++  const retryAt = Date.parse(value);
++  return Number.isFinite(retryAt)
++    ? Math.max(0, retryAt - Date.now())
++    : undefined;
++};
++
++const cancelFetchBody = async (
++  response: Awaited<ReturnType<typeof fetch>>
++): Promise<void> => {
++  try {
++    await response.body?.cancel();
++  } catch {}
++};
++
++const readFetchBodySnippet = async (
++  response: Awaited<ReturnType<typeof fetch>>,
++  maxBytes: number = 64 * 1024
++): Promise<string> => {
++  if (!response.body) return '';
++  const reader = response.body.getReader();
++  const chunks: Uint8Array[] = [];
++  let total = 0;
++  try {
++    while (total < maxBytes) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      if (!value?.length) continue;
++      const remaining = maxBytes - total;
++      const chunk = value.length > remaining ? value.slice(0, remaining) : value;
++      chunks.push(chunk);
++      total += chunk.length;
++      if (value.length > remaining) break;
++    }
++  } finally {
++    try {
++      await reader.cancel();
++    } catch {}
++  }
++  const combined = new Uint8Array(total);
++  let offset = 0;
++  for (const chunk of chunks) {
++    combined.set(chunk, offset);
++    offset += chunk.length;
++  }
++  return new TextDecoder('utf-8', { fatal: false }).decode(combined).trim();
++};
++
++const findNestedResolverUrl = (
++  value: unknown,
++  depth: number = 0
++): string | undefined => {
++  if (depth > 5 || value === null || value === undefined) return undefined;
++  if (typeof value === 'string') {
++    const trimmed = value.trim().replace(/^['"]|['"]$/g, '');
++    return /^https?:\/\/\S+$/i.test(trimmed) ? trimmed : undefined;
++  }
++  if (Array.isArray(value)) {
++    for (const item of value) {
++      const found = findNestedResolverUrl(item, depth + 1);
++      if (found) return found;
++    }
++    return undefined;
++  }
++  if (typeof value === 'object') {
++    const object = value as Record<string, unknown>;
++    for (const key of ['download', 'url', 'stream', 'location']) {
++      if (!(key in object)) continue;
++      const found = findNestedResolverUrl(object[key], depth + 1);
++      if (found) return found;
++    }
++    for (const [key, nested] of Object.entries(object)) {
++      if (['download', 'url', 'stream', 'location'].includes(key)) continue;
++      const found = findNestedResolverUrl(nested, depth + 1);
++      if (found) return found;
++    }
++  }
++  return undefined;
++};
++
++const getExternalResolverJsonError = (value: unknown): string | undefined => {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
++  const object = value as Record<string, unknown>;
++  if (object.success === false) {
++    return String(object.message ?? object.error ?? 'resolver reported success=false');
++  }
++  for (const key of ['error', 'errors']) {
++    const error = object[key];
++    if (
++      error !== undefined &&
++      error !== null &&
++      error !== false &&
++      error !== '' &&
++      !(Array.isArray(error) && error.length === 0)
++    ) {
++      return typeof error === 'string' ? error : JSON.stringify(error);
++    }
++  }
++  return undefined;
++};
++
++const resolverErrorBodyPattern =
++  /unavailable for legal reasons|legal reasons|try a different file|not available|unavailable|file not found|torrent not found|no (?:stream|link|file)s? found|invalid (?:torrent|magnet|link|file)|forbidden|access denied|permission denied|blocked|expired|not cached|uncached|resolver (?:error|failed)|playback (?:error|failed)|failed to (?:resolve|fetch|play)|could not (?:resolve|fetch|play)/i;
++
++const parseHttpTarget = (value: string, base: string): string => {
++  let target: URL;
++  try {
++    target = new URL(value, base);
++  } catch {
++    throw new ExternalResolverError(
++      'External resolver returned an invalid URL',
++      false
++    );
++  }
++  if (!['http:', 'https:'].includes(target.protocol)) {
++    throw new ExternalResolverError(
++      'External resolver returned an unsupported URL protocol',
++      false
++    );
++  }
++  return target.toString();
++};
++
++const resolveExternalResolverChain = async (
++  sourceUrl: string,
++  signal: AbortSignal,
++  clientIp?: string
++): Promise<string> => {
++  let currentUrl = sourceUrl;
++
++  for (let hop = 0; hop <= externalResolverConfig.maxHops; hop++) {
++    const response = await fetch(currentUrl, {
++      method: 'GET',
++      redirect: 'manual',
++      signal,
++      headers: {
++        Accept:
++          'video/*, audio/*, application/octet-stream, application/json, text/plain, */*;q=0.5',
++        'User-Agent': 'AIOStreams external resolver playback',
++        ...(clientIp
++          ? {
++              'X-Forwarded-For': clientIp,
++              'X-Real-IP': clientIp,
++            }
++          : {}),
++      },
++    });
++
++    const status = response.status;
++    const contentType =
++      response.headers.get('content-type')?.split(';')[0].trim().toLowerCase() ?? '';
++
++    if (status >= 300 && status < 400) {
++      const location = response.headers.get('location');
++      await cancelFetchBody(response);
++      if (!location) {
++        throw new ExternalResolverError(
++          `External resolver returned HTTP ${status} without Location`,
++          true,
++          status
++        );
++      }
++      const targetUrl = parseHttpTarget(location, currentUrl);
++      if (isKnownExternalResolverHopUrl(targetUrl)) {
++        currentUrl = targetUrl;
++        continue;
++      }
++      return targetUrl;
++    }
++
++    if ([408, 425, 500, 502, 503, 504].includes(status)) {
++      const retryAfterMs = parseResponseRetryAfterMs(response);
++      await cancelFetchBody(response);
++      throw new ExternalResolverError(
++        `External resolver returned transient HTTP ${status}`,
++        true,
++        status,
++        retryAfterMs
++      );
++    }
++
++    if (status === 429) {
++      const retryAfterMs = parseResponseRetryAfterMs(response);
++      await cancelFetchBody(response);
++      throw new ExternalResolverError(
++        'External resolver was rate limited',
++        resolveRetryConfig.retryRateLimits,
++        status,
++        retryAfterMs
++      );
++    }
++
++    if (status >= 400) {
++      const body = await readFetchBodySnippet(response, 8 * 1024);
++      throw new ExternalResolverError(
++        `External resolver returned HTTP ${status}${body ? `: ${body.slice(0, 180)}` : ''}`,
++        false,
++        status
++      );
++    }
++
++    if (status === 204) {
++      await cancelFetchBody(response);
++      throw new ExternalResolverError(
++        'External resolver returned an empty response',
++        true,
++        status
++      );
++    }
++
++    if (
++      /^(video|audio)\//.test(contentType) ||
++      /application\/(?:octet-stream|x-matroska|mp4|vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)/.test(
++        contentType
++      )
++    ) {
++      await cancelFetchBody(response);
++      return currentUrl;
++    }
++
++    if (
++      contentType.includes('text/') ||
++      contentType.includes('json') ||
++      contentType.includes('html') ||
++      contentType.includes('problem+json') ||
++      contentType === ''
++    ) {
++      const body = await readFetchBodySnippet(response);
++      let parsedJson: unknown;
++      if (contentType.includes('json') || /^[\[{]/.test(body)) {
++        try {
++          parsedJson = JSON.parse(body);
++        } catch {}
++      }
++      if (parsedJson !== undefined) {
++        const jsonError = getExternalResolverJsonError(parsedJson);
++        if (jsonError) {
++          throw new ExternalResolverError(
++            `External resolver error: ${jsonError.slice(0, 180)}`,
++            false,
++            status
++          );
++        }
++        const nested = findNestedResolverUrl(parsedJson);
++        if (nested) {
++          const targetUrl = parseHttpTarget(nested, currentUrl);
++          if (isKnownExternalResolverHopUrl(targetUrl)) {
++            currentUrl = targetUrl;
++            continue;
++          }
++          return targetUrl;
++        }
++      }
++      const plainUrl = /^https?:\/\/\S+$/i.test(body) ? body : undefined;
++      if (plainUrl) {
++        const targetUrl = parseHttpTarget(plainUrl, currentUrl);
++        if (isKnownExternalResolverHopUrl(targetUrl)) {
++          currentUrl = targetUrl;
++          continue;
++        }
++        return targetUrl;
++      }
++      if (resolverErrorBodyPattern.test(body)) {
++        throw new ExternalResolverError(
++          `External resolver returned an error response: ${body.slice(0, 180)}`,
++          false,
++          status
++        );
++      }
++      throw new ExternalResolverError(
++        `External resolver returned unexpected ${contentType || 'text'} content`,
++        true,
++        status
++      );
++    }
++
++    await cancelFetchBody(response);
++    return currentUrl;
++  }
++
++  throw new ExternalResolverError(
++    'External resolver returned too many resolver hops',
++    false
++  );
++};
++
++const classifyExternalResolverException = (
++  error: unknown
++): ResolveRetryDecision => {
++  if (error instanceof ExternalResolverError) {
++    return {
++      retry: error.retryable,
++      reason: error.message,
++      retryAfterMs: error.retryAfterMs,
++    };
++  }
++  const code = findErrorCode(error);
++  if (code && transientNetworkErrorCodes.has(code)) {
++    return { retry: true, reason: `transient network error: ${code}` };
++  }
++  const name =
++    error && typeof error === 'object' && 'name' in error
++      ? String((error as { name?: unknown }).name ?? '')
++      : '';
++  if (name === 'AbortError' || name === 'TimeoutError') {
++    return { retry: true, reason: name };
++  }
++  return {
++    retry: resolveRetryConfig.retryUnknownErrors,
++    reason: 'unknown external resolver error',
++  };
++};
++
+ router.use(corsMiddleware);
+ 
+ // block HEAD requests
+@@ -263,6 +630,170 @@ router.use((req: Request, res: Response, next: NextFunction) => {
+   }
+ });
+ 
++interface ExternalResolverParams {
++  encryptedResolver: string;
++  filename: string;
++}
++
++router.get(
++  '/external-resolver/:encryptedResolver/:filename',
++  async (
++    req: Request<ExternalResolverParams>,
++    res: Response,
++    next: NextFunction
++  ) => {
++    let payload: ExternalResolverPayload | undefined;
++    let lastError: unknown;
++    let lastDecision: ResolveRetryDecision | undefined;
++
++    try {
++      const decrypted = decryptString(req.params.encryptedResolver);
++      if (!decrypted.success) {
++        throw new APIError(
++          constants.ErrorCode.BAD_REQUEST,
++          undefined,
++          'Failed to decrypt external resolver URL'
++        );
++      }
++
++      try {
++        payload = ExternalResolverPayloadSchema.parse(
++          JSON.parse(decrypted.data)
++        ) as ExternalResolverPayload;
++      } catch (error) {
++        throw new APIError(
++          constants.ErrorCode.BAD_REQUEST,
++          undefined,
++          error instanceof ZodError
++            ? formatZodError(error)
++            : 'Failed to parse external resolver payload'
++        );
++      }
++
++      if (payload.expiresAt < Date.now()) {
++        throw new APIError(
++          constants.ErrorCode.BAD_REQUEST,
++          undefined,
++          'External resolver playback link has expired'
++        );
++      }
++
++      if (!isSupportedExternalResolverUrl(payload.url)) {
++        throw new APIError(
++          constants.ErrorCode.BAD_REQUEST,
++          undefined,
++          'Unsupported external resolver URL'
++        );
++      }
++
++      const provider = getExternalResolverProvider(payload.url) ?? 'unknown';
++      const totalAttempts = resolveRetryConfig.retries + 1;
++
++      for (let attempt = 1; attempt <= totalAttempts; attempt++) {
++        const controller = new AbortController();
++        const timeout = setTimeout(
++          () => controller.abort(),
++          externalResolverConfig.timeoutMs
++        );
++
++        try {
++          const finalUrl = await resolveExternalResolverChain(
++            payload.url,
++            controller.signal,
++            req.userIp
++          );
++          clearTimeout(timeout);
++
++          if (attempt > 1) {
++            logger.info('External resolver retry succeeded', {
++              provider,
++              attempt,
++              totalAttempts,
++            });
++          }
++
++          res.redirect(307, finalUrl);
++          return;
++        } catch (error) {
++          clearTimeout(timeout);
++          lastError = error;
++          lastDecision = classifyExternalResolverException(error);
++          const isLastAttempt = attempt >= totalAttempts;
++
++          if (!lastDecision.retry || isLastAttempt || req.destroyed) {
++            break;
++          }
++
++          const delayMs = getResolveRetryDelayMs(
++            attempt,
++            lastDecision.retryAfterMs
++          );
++          logger.warn('External resolver failed temporarily; retrying', {
++            provider,
++            attempt,
++            nextAttempt: attempt + 1,
++            totalAttempts,
++            delayMs,
++            reason: lastDecision.reason,
++          });
++          await sleep(delayMs);
++        }
++      }
++
++      logger.warn('External resolver retries exhausted', {
++        provider,
++        attempts: resolveRetryConfig.retries + 1,
++        reason: lastDecision?.reason,
++        message:
++          lastError instanceof Error ? lastError.message : String(lastError),
++      });
++
++      // A final client-side attempt is useful when the server/VPS route had a
++      // transient DNS, TLS, or CDN problem that may not affect the Stremio
++      // device. Permanent resolver failures still use an AIOStreams error clip.
++      if (
++        lastDecision?.retry &&
++        externalResolverConfig.fallbackToOriginal
++      ) {
++        res.redirect(307, payload.url);
++        return;
++      }
++
++      let staticFile: string = StaticFiles.INTERNAL_SERVER_ERROR;
++      const statusCode =
++        lastError instanceof ExternalResolverError
++          ? lastError.statusCode
++          : undefined;
++      if (statusCode === 401) staticFile = StaticFiles.UNAUTHORIZED;
++      else if (statusCode === 403) staticFile = StaticFiles.FORBIDDEN;
++      else if (statusCode === 429) staticFile = StaticFiles.TOO_MANY_REQUESTS;
++      else if (statusCode === 451) {
++        staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
++      }
++
++      res.redirect(307, `/static/${staticFile}`);
++    } catch (error) {
++      if (error instanceof APIError || error instanceof ZodError) {
++        next(error);
++        return;
++      }
++      logger.error(
++        { err: error },
++        `got unexpected error during external resolver playback: ${
++          error instanceof Error ? error.message : String(error)
++        }`
++      );
++      next(
++        new APIError(
++          constants.ErrorCode.INTERNAL_SERVER_ERROR,
++          undefined,
++          error instanceof Error ? error.message : String(error)
++        )
++      );
++    }
++  }
++);
++
+ interface PlaybackParams {
+   encryptedStoreAuth: string;
+   fileInfo: string;
