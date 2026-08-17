@@ -724,7 +724,11 @@ export class AnimeDatabase {
         parsedId.type,
         parsedId.value,
         parsedId.season ? Number(parsedId.season) : undefined,
-        parsedId.episode ? Number(parsedId.episode) : undefined
+        parsedId.absoluteEpisode
+          ? Number(parsedId.absoluteEpisode)
+          : parsedId.episode
+            ? Number(parsedId.episode)
+            : undefined
       ) !== null
     ) {
       return true;

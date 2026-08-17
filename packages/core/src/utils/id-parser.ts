@@ -39,6 +39,8 @@ export interface ParsedId {
   mediaType: string;
   season?: string;
   episode?: string;
+  /** Provider/anime absolute episode number when the request also carries a mapped S/E pair. */
+  absoluteEpisode?: string;
   generator: (
     value: string | number,
     season?: string,
@@ -103,7 +105,10 @@ export class IdParser {
       type: 'kitsuId',
       externalType: 'kitsu_id',
       prefixes: ['kitsu'],
-      regex: /^kitsu[:-]?(?<id>\d+)(?::(?<episode>\d+))?$/,
+      // Legacy: kitsu:<id>:<absoluteEpisode>
+      // Bridge: kitsu:<id>:<absoluteEpisode>:<mappedSeason>:<mappedEpisode>
+      regex:
+        /^kitsu[:-]?(?<id>\d+)(?::(?<absoluteEpisode>\d+))?(?::(?<season>\d+):(?<episode>\d+))?$/,
       format: (id) => Number(id),
       generator: (value, season, episode) => `kitsu:${value}:${episode}`,
     },
@@ -177,7 +182,7 @@ export class IdParser {
     for (const parser of IdParser.ID_PARSERS) {
       const match = stremioId.match(parser.regex);
       if (match?.groups) {
-        const { id, season, episode } = match.groups;
+        const { id, season, episode, absoluteEpisode } = match.groups;
         const parsedId: ParsedId = {
           type: parser.type,
           value: parser.format(id),
@@ -189,6 +194,12 @@ export class IdParser {
 
         if (season) parsedId.season = season;
         if (episode) parsedId.episode = episode;
+        if (absoluteEpisode) {
+          parsedId.absoluteEpisode = absoluteEpisode;
+          // Preserve legacy Kitsu semantics: kitsu:<id>:<episode> still behaves
+          // exactly as before when no mapped season/episode pair is appended.
+          if (!episode) parsedId.episode = absoluteEpisode;
+        }
 
         return parsedId;
       }

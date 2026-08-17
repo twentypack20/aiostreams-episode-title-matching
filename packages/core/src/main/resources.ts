@@ -438,12 +438,16 @@ async function precacheNextEpisode(
   const metadata = await context.getMetadata();
   const { season: seasonToPrecache, episode: episodeToPrecache } =
     getNextEpisode(currentSeason, currentEpisode, metadata);
+  if (!episodeToPrecache) return;
 
-  const precacheId = parsedId.generator(
-    parsedId.value,
-    seasonToPrecache?.toString(),
-    episodeToPrecache?.toString()
-  );
+  const precacheId =
+    parsedId.type === 'kitsuId' && parsedId.absoluteEpisode
+      ? `kitsu:${parsedId.value}:${Number(parsedId.absoluteEpisode) + 1}:${seasonToPrecache ?? currentSeason ?? 1}:${episodeToPrecache}`
+      : parsedId.generator(
+          parsedId.value,
+          seasonToPrecache?.toString(),
+          episodeToPrecache?.toString()
+        );
   logger.debug(
     {
       titleId: parsedId.value,

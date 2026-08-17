@@ -151,7 +151,11 @@ export class StreamContext {
         parsedId.type,
         parsedId.value,
         parsedId.season ? Number(parsedId.season) : undefined,
-        parsedId.episode ? Number(parsedId.episode) : undefined
+        parsedId.absoluteEpisode
+          ? Number(parsedId.absoluteEpisode)
+          : parsedId.episode
+            ? Number(parsedId.episode)
+            : undefined
       );
 
       // Enrich parsedId with anime entry data if available and no season specified
@@ -183,6 +187,21 @@ export class StreamContext {
   }
 
   /**
+   * ID sent to third-party Stremio addons. AIOMetadata v5 may append a
+   * conventional season/episode bridge to Kitsu episode IDs, but upstream
+   * addons only understand the legacy kitsu:<id>:<absoluteEpisode> form.
+   */
+  public getAddonRequestId(): string {
+    if (
+      this.parsedId?.type === 'kitsuId' &&
+      this.parsedId.absoluteEpisode
+    ) {
+      return `kitsu:${this.parsedId.value}:${this.parsedId.absoluteEpisode}`;
+    }
+    return this.id;
+  }
+
+  /**
    * Start fetching metadata asynchronously.
    * Call this early (e.g., when starting addon fetches) to parallelize.
    */
@@ -204,8 +223,14 @@ export class StreamContext {
           this.type as any
         );
 
-        // Calculate absolute episode for anime
-        let absoluteEpisode: number | undefined;
+        // Calculate absolute episode for anime. Extended Kitsu bridge IDs carry
+        // the provider/anime absolute episode explicitly; prefer that value.
+        const hasExplicitAbsoluteEpisode = Boolean(
+          this.parsedId!.absoluteEpisode
+        );
+        let absoluteEpisode: number | undefined = this.parsedId!.absoluteEpisode
+          ? Number(this.parsedId!.absoluteEpisode)
+          : undefined;
         let relativeAbsoluteEpisode: number | undefined;
         if (
           this.isAnime &&
@@ -219,13 +244,16 @@ export class StreamContext {
               episodes: episode_count,
             })
           );
-          absoluteEpisode = Number(
+          const calculatedAbsoluteEpisode = Number(
             calculateAbsoluteEpisode(
               this.parsedId!.season,
               this.parsedId!.episode,
               seasons
             )
           );
+          if (!hasExplicitAbsoluteEpisode) {
+            absoluteEpisode = calculatedAbsoluteEpisode;
+          }
 
           // Calculate relative absolute episode (within current AniDB entry)
           const startingSeason =
@@ -264,6 +292,7 @@ export class StreamContext {
           if (
             this.animeEntry?.imdb?.nonImdbEpisodes &&
             absoluteEpisode &&
+            !hasExplicitAbsoluteEpisode &&
             !isAlreadyAbsoluteForNonImdb
           ) {
             const nonImdbEpisodesBefore =

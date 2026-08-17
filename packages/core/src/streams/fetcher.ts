@@ -134,7 +134,11 @@ class StreamFetcher {
       const start = Date.now();
 
       try {
-        const streams = await new Wrapper(addon).getStreams(type, id);
+        const addonRequestId = context.getAddonRequestId();
+        const streams = await new Wrapper(addon).getStreams(
+          type,
+          addonRequestId
+        );
         const errorStreams = streams.filter(
           (s) => s.type === constants.ERROR_STREAM_TYPE
         );

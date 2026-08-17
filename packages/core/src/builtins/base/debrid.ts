@@ -564,7 +564,11 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       parsedId.type,
       parsedId.value,
       parsedId.season ? Number(parsedId.season) : undefined,
-      parsedId.episode ? Number(parsedId.episode) : undefined
+      parsedId.absoluteEpisode
+        ? Number(parsedId.absoluteEpisode)
+        : parsedId.episode
+          ? Number(parsedId.episode)
+          : undefined
     );
 
     // Extract seasonYear from anime entry
@@ -581,8 +585,12 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       tvdbApiKey: this.userData.tvdbApiKey,
     }).getMetadata(parsedId, type === 'movie' ? 'movie' : 'series');
 
-    // Calculate absolute episode if needed
-    let absoluteEpisode: number | undefined;
+    // Calculate absolute episode if needed. Extended Kitsu bridge IDs provide
+    // the provider/anime absolute episode explicitly.
+    const hasExplicitAbsoluteEpisode = Boolean(parsedId.absoluteEpisode);
+    let absoluteEpisode: number | undefined = parsedId.absoluteEpisode
+      ? Number(parsedId.absoluteEpisode)
+      : undefined;
     let relativeAbsoluteEpisode: number | undefined;
     if (animeEntry && parsedId.season && parsedId.episode && metadata.seasons) {
       const seasons = metadata.seasons.map(
@@ -594,10 +602,13 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       this.logger.debug(
         `Calculating absolute episode with current season and episode: ${parsedId.season}, ${parsedId.episode} and seasons: ${JSON.stringify(seasons)}`
       );
-      // Calculate base absolute episode
-      absoluteEpisode = Number(
+      // Calculate base absolute episode when the request did not carry one.
+      const calculatedAbsoluteEpisode = Number(
         calculateAbsoluteEpisode(parsedId.season, parsedId.episode, seasons)
       );
+      if (!hasExplicitAbsoluteEpisode) {
+        absoluteEpisode = calculatedAbsoluteEpisode;
+      }
 
       // Calculate relative absolute episode (within current AniDB entry)
       // Find the first season of this AniDB entry
@@ -638,6 +649,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       if (
         animeEntry?.imdb?.nonImdbEpisodes &&
         absoluteEpisode &&
+        !hasExplicitAbsoluteEpisode &&
         parsedId.type === 'imdbId' &&
         !isAlreadyAbsoluteForNonImdb
       ) {
