@@ -45,6 +45,159 @@ export type AddonDispositionMap = Map<string, AddonDispositionInfo>;
 
 const logger = createLogger('fetcher');
 
+function parseIntegerEnv(
+  value: string | undefined,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === '') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+const addonFetchRetryConfig = {
+  // Retries are additional attempts after the initial addon stream fetch.
+  retries: parseIntegerEnv(process.env.ADDON_FETCH_RETRIES, 2, 0, 5),
+  delayMs: parseIntegerEnv(
+    process.env.ADDON_FETCH_RETRY_DELAY_MS,
+    300,
+    0,
+    30_000
+  ),
+  maxDelayMs: parseIntegerEnv(
+    process.env.ADDON_FETCH_RETRY_MAX_DELAY_MS,
+    1500,
+    0,
+    60_000
+  ),
+  retryRateLimits: parseBooleanEnv(
+    process.env.ADDON_FETCH_RETRY_ON_RATE_LIMIT,
+    false
+  ),
+};
+
+type AddonFetchRetryDecision = {
+  retry: boolean;
+  reason: string;
+  statusCode?: number;
+};
+
+function getHttpStatusFromAddonError(error: unknown): number | undefined {
+  const direct = (error as { status?: unknown; statusCode?: unknown }) ?? {};
+  const candidates = [direct.status, direct.statusCode];
+  for (const value of candidates) {
+    if (typeof value === 'number' && Number.isInteger(value)) return value;
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  // Wrapper resource requests currently throw messages such as
+  // "502 - Bad Gateway", so preserve the status even when the Error object
+  // itself has no status/statusCode property.
+  const match = message.match(/(?:^|\b)([45]\d{2})(?:\s*-|\b)/);
+  return match ? Number.parseInt(match[1], 10) : undefined;
+}
+
+function classifyAddonFetchRetry(error: unknown): AddonFetchRetryDecision {
+  const statusCode = getHttpStatusFromAddonError(error);
+  if (statusCode !== undefined) {
+    if (statusCode === 429) {
+      return {
+        retry: addonFetchRetryConfig.retryRateLimits,
+        reason: addonFetchRetryConfig.retryRateLimits
+          ? 'HTTP 429 rate limit (opt-in retry)'
+          : 'HTTP 429 rate limit',
+        statusCode,
+      };
+    }
+    if (statusCode >= 500 && statusCode <= 599) {
+      return { retry: true, reason: `HTTP ${statusCode}`, statusCode };
+    }
+    if (statusCode >= 400 && statusCode <= 499) {
+      return { retry: false, reason: `HTTP ${statusCode}`, statusCode };
+    }
+  }
+
+  const message = (
+    error instanceof Error ? error.message : String(error ?? '')
+  ).toLowerCase();
+  const code = String(
+    (error as { code?: unknown; cause?: { code?: unknown } })?.code ??
+      (error as { cause?: { code?: unknown } })?.cause?.code ??
+      ''
+  ).toUpperCase();
+
+  if (
+    message.includes('timed out') ||
+    message.includes('timeout') ||
+    code === 'ETIMEDOUT' ||
+    code === 'UND_ERR_CONNECT_TIMEOUT' ||
+    code === 'UND_ERR_HEADERS_TIMEOUT'
+  ) {
+    return { retry: true, reason: 'timeout' };
+  }
+
+  const retryableNetworkCodes = new Set([
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'EHOSTUNREACH',
+    'ENETUNREACH',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'EPIPE',
+    'UND_ERR_SOCKET',
+  ]);
+  if (
+    retryableNetworkCodes.has(code) ||
+    message.includes('fetch failed') ||
+    message.includes('socket hang up') ||
+    message.includes('network error') ||
+    message.includes('connection reset')
+  ) {
+    return {
+      retry: true,
+      reason: code ? `network error ${code}` : 'network error',
+    };
+  }
+
+  // Parsing/schema/recursive-request failures are deterministic for the same
+  // payload and should not be amplified with repeated addon requests.
+  if (
+    message.includes('parse') ||
+    message.includes('json') ||
+    message.includes('unexpected token') ||
+    message.includes('no valid streams') ||
+    message.includes('recursive') ||
+    message.includes('invalid')
+  ) {
+    return { retry: false, reason: 'non-transient response error' };
+  }
+
+  // Unknown application exceptions are deliberately not retried. This keeps
+  // the retry layer focused on transient gateway/network failures.
+  return { retry: false, reason: 'unknown/non-transient error' };
+}
+
+function addonFetchRetryDelayMs(retryNumber: number): number {
+  const exponential =
+    addonFetchRetryConfig.delayMs * Math.pow(2, Math.max(0, retryNumber - 1));
+  return Math.min(addonFetchRetryConfig.maxDelayMs, exponential);
+}
+
+async function waitForAddonFetchRetry(delayMs: number): Promise<void> {
+  if (delayMs <= 0) return;
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
 class StreamFetcher {
   private userData: UserData;
   private filter: StreamFilter;
@@ -135,10 +288,56 @@ class StreamFetcher {
 
       try {
         const addonRequestId = context.getAddonRequestId();
-        const streams = await new Wrapper(addon).getStreams(
-          type,
-          addonRequestId
-        );
+        const wrapper = new Wrapper(addon);
+        let streams: ParsedStream[] | null = null;
+
+        for (
+          let attempt = 0;
+          attempt <= addonFetchRetryConfig.retries;
+          attempt++
+        ) {
+          try {
+            streams = await wrapper.getStreams(type, addonRequestId);
+            if (attempt > 0) {
+              logger.info(
+                {
+                  addon: getAddonName(addon),
+                  attempts: attempt + 1,
+                  retriesUsed: attempt,
+                },
+                'addon fetch retry succeeded'
+              );
+            }
+            break;
+          } catch (error) {
+            const decision = classifyAddonFetchRetry(error);
+            const isLastAttempt = attempt >= addonFetchRetryConfig.retries;
+            if (!decision.retry || isLastAttempt) {
+              throw error;
+            }
+
+            const retryNumber = attempt + 1;
+            const delayMs = addonFetchRetryDelayMs(retryNumber);
+            logger.warn(
+              {
+                addon: getAddonName(addon),
+                err: error instanceof Error ? error.message : String(error),
+                reason: decision.reason,
+                statusCode: decision.statusCode,
+                attempt: attempt + 1,
+                nextAttempt: attempt + 2,
+                retriesRemaining: addonFetchRetryConfig.retries - attempt,
+                delayMs,
+              },
+              'addon fetch failed temporarily; retrying'
+            );
+            await waitForAddonFetchRetry(delayMs);
+          }
+        }
+
+        if (streams === null) {
+          throw new Error('Addon fetch retry loop completed without a result');
+        }
         const errorStreams = streams.filter(
           (s) => s.type === constants.ERROR_STREAM_TYPE
         );

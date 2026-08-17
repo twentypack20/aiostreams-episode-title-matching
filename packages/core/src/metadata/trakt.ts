@@ -30,6 +30,15 @@ const logger = createLogger('trakt');
 export async function getTraktAliases(
   parsedId: ParsedId
 ): Promise<MetadataTitle[] | null> {
+  const clientId = appConfig.metadata.trakt.clientId?.trim();
+  if (!clientId) {
+    logger.debug(
+      { id: parsedId.value, type: parsedId.type },
+      'Skipping Trakt aliases because TRAKT_CLIENT_ID is not configured'
+    );
+    return null;
+  }
+
   const cacheKey = `${parsedId.type}:${parsedId.value}`;
   const cachedAliases = await traktAliasCache.get(cacheKey);
   if (cachedAliases) {
@@ -67,7 +76,7 @@ export async function getTraktAliases(
           'Content-Type': 'application/json',
           'User-Agent': appConfig.http.defaultUserAgent,
           'trakt-api-version': '2',
-          'trakt-api-key': appConfig.metadata.trakt.clientId ?? '',
+          'trakt-api-key': clientId,
         },
       }
     );

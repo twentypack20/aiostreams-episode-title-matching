@@ -173,3 +173,56 @@ are also accepted and take priority when both are set:
   PLAYBACK_PREFLIGHT_CONCURRENCY
   PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE
   PLAYBACK_HIDE_LEGAL_UNAVAILABLE
+
+Initial addon stream-fetch retry + Trakt guard
+----------------------------------------------
+This custom build now adds a retry layer to the *initial* stream-list request
+made to configured addons such as Torrentio. This is intentionally separate
+from the existing playback/debrid resolver retry and final playback preflight.
+
+Default behavior:
+- 1 initial addon request plus 2 retries.
+- Exponential delays of 300 ms then 600 ms (capped by the configured maximum).
+- Retries HTTP 5xx responses (including 502 Bad Gateway), network errors, and
+  timeouts.
+- Does not retry deterministic parse/schema/invalid-response failures.
+- Does not retry HTTP 4xx responses.
+- Does not retry HTTP 429 by default; rate-limit retry is opt-in.
+- If all attempts fail, AIOStreams keeps the existing behavior: that addon
+  contributes zero streams while other addons continue normally.
+
+Optional docker-compose environment overrides:
+
+  ADDON_FETCH_RETRIES: "2"
+  ADDON_FETCH_RETRY_DELAY_MS: "300"
+  ADDON_FETCH_RETRY_MAX_DELAY_MS: "1500"
+  ADDON_FETCH_RETRY_ON_RATE_LIMIT: "false"
+
+Useful logs:
+
+  docker logs aiostreams --since 20m 2>&1 \
+    | grep -Ei 'addon fetch.*retry|addon fetch failed|502|503|504'
+
+Successful recovery is logged as:
+
+  addon fetch retry succeeded
+
+Trakt alias guard
+-----------------
+AIOStreams' Trakt alias lookup uses a server-side TRAKT_CLIENT_ID. It is not
+connected to the user's Trakt login/scrobbling inside Stremio.
+
+Previously FETCH_TRAKT_ALIASES defaulted to true even when TRAKT_CLIENT_ID was
+unset, which could cause repeated Trakt 403 responses. This build skips Trakt
+alias requests when the client ID is missing. No environment change is needed
+for that safe behavior.
+
+To use Trakt aliases intentionally, configure a valid server-side client ID:
+
+  TRAKT_CLIENT_ID: "..."
+  FETCH_TRAKT_ALIASES: "true"
+
+To disable Trakt aliases explicitly:
+
+  FETCH_TRAKT_ALIASES: "false"
+

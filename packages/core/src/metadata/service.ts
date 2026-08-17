@@ -148,8 +148,15 @@ export class MetadataService {
               promises.push(Promise.resolve(undefined));
             }
 
-            // Trakt aliases
-            if (imdbId && appConfig.metadata.trakt.fetchAliases) {
+            // Trakt aliases. A user's Stremio/Trakt login does not provide
+            // the server-side Trakt API client ID required by this lookup.
+            // Skip the request entirely when no client ID is configured so we
+            // do not generate a 403 on every metadata/stream request.
+            if (
+              imdbId &&
+              appConfig.metadata.trakt.fetchAliases &&
+              appConfig.metadata.trakt.clientId?.trim()
+            ) {
               promises.push(getTraktAliases(id));
             } else {
               promises.push(Promise.resolve(undefined));
