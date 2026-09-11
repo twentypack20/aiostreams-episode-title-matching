@@ -369,6 +369,101 @@ class StreamFilterer {
       process.env.TORRENTIO_ANIME_RESOLVE_MODE || 'allow'
     ).toLowerCase();
 
+    // One physical torrent file can arrive through several playback routes
+    // (for example native AIOStreams plus Torrentio/TorBox resolver copies).
+    // If any copy already has provider/container-verified audio languages, make
+    // those languages authoritative for the other copies of the exact same
+    // file before language filtering. Match only infoHash + fileIdx: hash-only
+    // propagation would be unsafe for season packs containing multiple files.
+    const authoritativeLanguagesByFile = new Map<
+      string,
+      Map<string, string[]>
+    >();
+    for (const stream of streams) {
+      const hash = stream.torrent?.infoHash;
+      const fileIdx = stream.torrent?.fileIdx;
+      const languages = stream.parsedFile?.languages;
+      if (
+        stream.mediaInfoSource !== 'provider' ||
+        !hash ||
+        fileIdx === undefined ||
+        !languages?.length
+      ) {
+        continue;
+      }
+
+      const authoritativeLanguages = languages.filter(
+        (language) => language !== 'Original'
+      );
+      if (authoritativeLanguages.length === 0) continue;
+
+      const identity = `${hash.toLowerCase()}:${fileIdx}`;
+      const normalisedLanguages = authoritativeLanguages.map((language) =>
+        language.toLowerCase()
+      );
+      const signature = [...new Set(normalisedLanguages)].sort().join('|');
+      const candidates =
+        authoritativeLanguagesByFile.get(identity) ?? new Map<string, string[]>();
+      candidates.set(signature, [...authoritativeLanguages]);
+      authoritativeLanguagesByFile.set(identity, candidates);
+    }
+
+    let propagatedAuthoritativeLanguages = 0;
+    for (const stream of streams) {
+      if (stream.mediaInfoSource === 'provider') continue;
+      const hash = stream.torrent?.infoHash;
+      const fileIdx = stream.torrent?.fileIdx;
+      if (!hash || fileIdx === undefined) continue;
+
+      const identity = `${hash.toLowerCase()}:${fileIdx}`;
+      const candidates = authoritativeLanguagesByFile.get(identity);
+      if (!candidates?.size) continue;
+
+      if (candidates.size !== 1) {
+        logger.warn(
+          'Conflicting provider/container audio languages for equivalent torrent file; keeping release metadata fallback',
+          {
+            id,
+            hashPrefix: hash.slice(0, 10),
+            fileIdx,
+            languageSets: [...candidates.keys()],
+          }
+        );
+        continue;
+      }
+
+      const languages = [...candidates.values()][0];
+      stream.parsedFile = {
+        ...(stream.parsedFile ?? {
+          audioChannels: [],
+          visualTags: [],
+          audioTags: [],
+          languages: [],
+        }),
+        languages: [...languages],
+      };
+      stream.mediaInfoSource = 'provider';
+      propagatedAuthoritativeLanguages += 1;
+
+      logger.debug(
+        'Propagated authoritative provider/container audio languages to equivalent resolver stream',
+        {
+          id,
+          addon: stream.addon.name,
+          hashPrefix: hash.slice(0, 10),
+          fileIdx,
+          languages: stream.parsedFile.languages,
+        }
+      );
+    }
+
+    if (propagatedAuthoritativeLanguages > 0) {
+      logger.debug(
+        'Completed authoritative audio-language propagation across equivalent playback routes',
+        { id, propagated: propagatedAuthoritativeLanguages }
+      );
+    }
+
     const start = Date.now();
     // Sub-phase timing accumulators for this filter() call
     let metadataMs = 0;
@@ -1966,47 +2061,6 @@ class StreamFilterer {
       );
     };
 
-    const shouldAllowAnimeLikelyEnglishAudioAliasStream = (
-      stream: ParsedStream
-    ): boolean => {
-      if (!this.userData.requiredLanguages?.includes('English' as any)) {
-        return false;
-      }
-      if (!isAnime) return false;
-      if (!originalLanguage || originalLanguage === 'English') return false;
-
-      const languages = stream.parsedFile?.languages?.length
-        ? stream.parsedFile.languages
-        : ['Unknown'];
-      const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
-
-      // v13: anime specials often only parse as "Dual Audio"/"Dubbed" without
-      // an explicit English language tag. Treat those as English-audio evidence
-      // unless there are explicit non-English language tags besides the original
-      // language and vague aliases. This keeps subtitle-only GB/ES/FR/PT-style
-      // releases blocked while allowing cached dual-audio specials through.
-      if (!languageSet.has('dual audio') && !languageSet.has('dubbed')) {
-        return false;
-      }
-
-      const originalLanguageLower = originalLanguage.toLowerCase();
-      const allowedAliases = new Set([
-        'unknown',
-        'multi',
-        'original',
-        'dual audio',
-        'dubbed',
-        originalLanguageLower,
-      ]);
-
-      const explicitNonEnglishLanguages = languages.filter((lang) => {
-        const lower = lang.toLowerCase();
-        return lower !== 'english' && !allowedAliases.has(lower);
-      });
-
-      return explicitNonEnglishLanguages.length === 0;
-    };
-
     const shouldAllowAnimeSpecialUnknownLanguageFallbackStream = (
       stream: ParsedStream
     ): boolean => {
@@ -2093,16 +2147,22 @@ class StreamFilterer {
         .trim();
 
     const getDuplicateKey = (stream: ParsedStream): string | undefined => {
+      // Hash + file index is the strongest identity available for a resolver
+      // stream. Prefer it over display/filename text so the same torrent file
+      // returned through native AIOStreams and Torrentio is recognised even if
+      // the two addons format the release name differently. Never collapse a
+      // season pack by hash alone when a file index is unavailable.
+      const hash = stream.torrent?.infoHash || stream.videoHash;
+      const fileIdx = stream.torrent?.fileIdx;
+      if (hash && fileIdx !== undefined) {
+        return `hash:${hash.toLowerCase()}:file:${fileIdx}`;
+      }
+
       const filenameKey = normaliseStreamIdentity(
         stream.filename || stream.parsedFile?.title || stream.originalName
       );
       if (filenameKey.length >= 12) {
         return `name:${filenameKey}`;
-      }
-
-      const hash = stream.torrent?.infoHash || stream.videoHash;
-      if (hash) {
-        return `hash:${hash.toLowerCase()}`;
       }
 
       return undefined;
@@ -2761,7 +2821,6 @@ class StreamFilterer {
           (file?.languages.length ? file.languages : ['Unknown']).includes(lang)
         ) &&
         !shouldAllowUnknownEnglishOriginalStream(stream) &&
-        !shouldAllowAnimeLikelyEnglishAudioAliasStream(stream) &&
         !shouldAllowAnimeSpecialUnknownLanguageFallbackStream(stream) &&
         !shouldAllowForeignOriginalUnknownLanguageFallbackStream(stream)
       ) {
@@ -2777,19 +2836,6 @@ class StreamFilterer {
         shouldAllowUnknownEnglishOriginalStream(stream)
       ) {
         logEpisodeTitleDebug('Language filter allowed English-original stream with vague language metadata', {
-          filename: stream.filename,
-          folderName: stream.folderName,
-          originalName: stream.originalName,
-          parsedLanguages: file?.languages,
-          originalLanguage,
-        });
-      }
-
-      if (
-        !skipLanguageFiltering &&
-        shouldAllowAnimeLikelyEnglishAudioAliasStream(stream)
-      ) {
-        logEpisodeTitleDebug('Language filter allowed anime likely-English audio alias stream', {
           filename: stream.filename,
           folderName: stream.folderName,
           originalName: stream.originalName,

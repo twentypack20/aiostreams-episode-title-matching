@@ -241,3 +241,17 @@ Key defaults:
 When actual provider/container media metadata is present, its audio languages are
 authoritative over filename/release guesses. Native AIOStreams playback requests
 also force a fresh final debrid/CDN link on the real Stremio click by default.
+
+AIOStreams v7.1: resolver language propagation repair
+-----------------------------------------------------
+See V7_1_RESOLVER_LANGUAGE_PROPAGATION.md.
+
+v7.1 preserves the v7 provider-media and fresh-playback work, then closes the
+remaining language gap for equivalent resolver copies of the same torrent file:
+  - authoritative media languages propagate by exact infoHash + fileIdx;
+  - conflicting provider language sets fail open instead of being guessed;
+  - Dual Audio / Dubbed no longer satisfy Required English by themselves;
+  - anime duplicate matching prefers infoHash + fileIdx when available;
+  - successful external resolver playback now has safe info-level diagnostics.
+
+No new environment variables are required.

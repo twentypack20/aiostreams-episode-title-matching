@@ -811,6 +811,9 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         folderSize: torrentOrNzb.size,
       },
       parsedMediaInfo: torrentOrNzb.parsedMediaInfo,
+      mediaInfoSource: torrentOrNzb.authoritativeMediaInfo?.languages?.length
+        ? 'provider'
+        : 'release',
     };
   }
 

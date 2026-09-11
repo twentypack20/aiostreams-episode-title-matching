@@ -166,6 +166,15 @@ class StreamParser {
 
     parsedStream.parsedFile = this.getParsedFile(stream, parsedStream);
 
+    const providedMediaInfoSource = (stream as Record<string, unknown>)
+      .mediaInfoSource;
+    if (
+      providedMediaInfoSource === 'provider' ||
+      providedMediaInfoSource === 'release'
+    ) {
+      parsedStream.mediaInfoSource = providedMediaInfoSource;
+    }
+
     parsedStream.torrent = {
       infoHash: stream.infoHash ?? this.getInfoHash(stream, parsedStream),
       seeders: this.getSeeders(stream, parsedStream),

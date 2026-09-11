@@ -612,7 +612,7 @@ async function buildDebridStreams(
             original?.folderName,
             original?.originalName
           );
-      if (result.authoritativeMediaInfo) {
+      if (result.authoritativeMediaInfo?.languages?.length) {
         debridStream.mediaInfoSource = 'provider';
         logger.debug('Applied authoritative provider/container media info', {
           service: result.service?.id,

@@ -699,6 +699,12 @@ router.get(
       const provider = getExternalResolverProvider(payload.url) ?? 'unknown';
       const totalAttempts = resolveRetryConfig.retries + 1;
 
+      logger.info('External resolver playback request received', {
+        provider,
+        totalAttempts,
+        clientIpPresent: Boolean(req.userIp),
+      });
+
       for (let attempt = 1; attempt <= totalAttempts; attempt++) {
         const controller = new AbortController();
         const timeout = setTimeout(
@@ -713,6 +719,18 @@ router.get(
             req.userIp
           );
           clearTimeout(timeout);
+
+          let finalHost = 'unknown';
+          try {
+            finalHost = new URL(finalUrl).host;
+          } catch {}
+
+          logger.info('External resolver playback URL resolved', {
+            provider,
+            attempt,
+            totalAttempts,
+            finalHost,
+          });
 
           if (attempt > 1) {
             logger.info('External resolver retry succeeded', {
