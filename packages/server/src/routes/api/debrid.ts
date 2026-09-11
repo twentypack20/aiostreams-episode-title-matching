@@ -84,6 +84,16 @@ const resolveRetryConfig = {
   ),
 };
 
+const playbackFreshLinkConfig = {
+  // Debrid CDN links can be temporary or client-IP-sensitive.  Generate a fresh
+  // final link for real playback requests by default instead of reusing an
+  // hour-old cached redirect. Retries always force-refresh regardless.
+  forceFresh: parseBooleanEnv(
+    process.env.PLAYBACK_FORCE_FRESH_DEBRID_LINK,
+    true
+  ),
+};
+
 const permanentResolveErrorCodes = new Set<DebridError['code']>([
   'BAD_REQUEST',
   'CONFLICT',
@@ -909,6 +919,15 @@ router.get(
         req.userIp
       );
 
+      logger.info('Playback resolve request received', {
+        provider: storeAuth.id,
+        playbackType: playbackInfo.type,
+        hashPrefix: fileInfo.hash?.slice(0, 10),
+        fileIndex: fileInfo.fileIndex,
+        clientIpPresent: Boolean(req.userIp),
+        forceFresh: playbackFreshLinkConfig.forceFresh,
+      });
+
       const resolveWithRetry = async (
         currentPlaybackInfo: PlaybackInfo,
         currentFilename: string
@@ -917,12 +936,30 @@ router.get(
 
         for (let attempt = 1; attempt <= totalAttempts; attempt++) {
           try {
+            const forceRefresh =
+              playbackFreshLinkConfig.forceFresh || attempt > 1;
             const result = await debridInterface.resolve(
               currentPlaybackInfo,
               currentFilename,
               fileInfo.cacheAndPlay ?? false,
-              fileInfo.autoRemoveDownloads
+              fileInfo.autoRemoveDownloads,
+              { forceRefresh }
             );
+
+            if (result) {
+              let finalHost = 'unknown';
+              try {
+                finalHost = new URL(result).host;
+              } catch {}
+              logger.info('Debrid playback URL resolved', {
+                provider: storeAuth.id,
+                attempt,
+                totalAttempts,
+                forceRefresh,
+                finalHost,
+                playbackType: currentPlaybackInfo.type,
+              });
+            }
 
             if (attempt > 1) {
               logger.info(

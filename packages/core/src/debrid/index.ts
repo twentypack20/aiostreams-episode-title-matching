@@ -2,6 +2,7 @@
 export * from './utils.js';
 export * from './stremthru.js';
 export * from './torbox.js';
+export * from './provider-media-info.js';
 export * from './nzbdav.js';
 export * from './altmount.js';
 

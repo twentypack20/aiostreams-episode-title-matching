@@ -245,6 +245,11 @@ export type TorrentInfo = z.infer<typeof TorrentInfoSchema>;
 export type UsenetInfo = z.infer<typeof UsenetInfoSchema>;
 export type TitleMetadata = z.infer<typeof TitleMetadataSchema>;
 
+export type ResolveOptions = {
+  /** Skip any cached final playback URL and ask the provider for a fresh link. */
+  forceRefresh?: boolean;
+};
+
 interface BaseDebridService {
   readonly serviceName: ServiceId;
   readonly capabilities: { torrents: boolean; usenet: boolean };
@@ -253,7 +258,8 @@ interface BaseDebridService {
     playbackInfo: PlaybackInfo,
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    options?: ResolveOptions
   ): Promise<string | undefined>;
 
   refreshLibraryCache?(sources?: ('torrent' | 'nzb')[]): Promise<void>;

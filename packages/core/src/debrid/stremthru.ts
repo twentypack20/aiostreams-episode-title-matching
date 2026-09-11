@@ -23,6 +23,7 @@ import {
   TorrentDebridService,
   UsenetDebridService,
   DebridFailureCache,
+  ResolveOptions,
 } from './base.js';
 import { parseTorrentTitle, ParsedResult } from '@viren070/parse-torrent-title';
 import assert from 'assert';
@@ -238,6 +239,7 @@ export class StremThruService
           link: file.link,
           path: file.path,
           index: file.index,
+          mediaInfo: (file as any).media_info,
         })),
         size: (result.data.files ?? []).reduce(
           (acc, file) => acc + file.size,
@@ -400,6 +402,7 @@ export class StremThruService
           link: file.link,
           path: file.path,
           index: file.index,
+          mediaInfo: (file as any).media_info,
         })),
       };
     } catch (error) {
@@ -577,6 +580,7 @@ export class StremThruService
             index: file.index,
             link: file.link,
             path: file.path,
+            mediaInfo: (file as any).media_info,
           })),
         }));
 
@@ -639,6 +643,7 @@ export class StremThruService
           link: file.link,
           path: file.path,
           index: file.index,
+          mediaInfo: (file as any).media_info,
         })),
       };
     } catch (error) {
@@ -799,7 +804,8 @@ export class StremThruService
     playbackInfo: PlaybackInfo,
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    options?: ResolveOptions
   ): Promise<string | undefined> {
     if (playbackInfo.type === 'usenet') {
       const effectiveCacheAndPlay =
@@ -819,6 +825,7 @@ export class StremThruService
           {
             cacheAndPlay: effectiveCacheAndPlay,
             autoRemoveDownloads: effectiveAutoRemove,
+            forceRefresh: options?.forceRefresh === true,
           }
         ),
         () =>
@@ -826,7 +833,8 @@ export class StremThruService
             playbackInfo,
             filename,
             effectiveCacheAndPlay,
-            effectiveAutoRemove
+            effectiveAutoRemove,
+            options
           ),
         {
           timeout: effectiveCacheAndPlay
@@ -852,14 +860,19 @@ export class StremThruService
         filename,
         this.config.stremthru.token,
         this.config.clientIp,
-        { cacheAndPlay, autoRemoveDownloads }
+        {
+          cacheAndPlay,
+          autoRemoveDownloads,
+          forceRefresh: options?.forceRefresh === true,
+        }
       ),
       () =>
         this._resolveTorrent(
           playbackInfo,
           filename,
           cacheAndPlay,
-          autoRemoveDownloads
+          autoRemoveDownloads,
+          options
         ),
       {
         timeout: cacheAndPlay
@@ -880,7 +893,8 @@ export class StremThruService
     playbackInfo: PlaybackInfo & { type: 'torrent' },
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    options?: ResolveOptions
   ): Promise<string | undefined> {
     const { hash, metadata } = playbackInfo;
     const cacheKey = buildResolveKey(
@@ -891,9 +905,17 @@ export class StremThruService
       this.config.stremthru.token,
       this.config.clientIp
     );
-    const cachedLink = await StremThruService.playbackLinkCache.get(cacheKey);
+    const forceRefresh = options?.forceRefresh === true;
+    const cachedLink = forceRefresh
+      ? undefined
+      : await StremThruService.playbackLinkCache.get(cacheKey);
 
-    if (cachedLink !== undefined) {
+    if (forceRefresh) {
+      logger.debug(`Bypassing cached playback link for fresh resolve`, {
+        service: this.serviceName,
+        hash: hash.slice(0, 10),
+      });
+    } else if (cachedLink !== undefined) {
       logger.debug(`Using cached link for ${hash}`);
       if (cachedLink === null) {
         if (!cacheAndPlay) {
@@ -1121,7 +1143,8 @@ export class StremThruService
     playbackInfo: PlaybackInfo & { type: 'usenet' },
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    options?: ResolveOptions
   ): Promise<string | undefined> {
     const { nzb, metadata, hash } = playbackInfo;
     const cacheKey = buildResolveKey(
@@ -1132,9 +1155,17 @@ export class StremThruService
       this.config.stremthru.token,
       this.config.clientIp
     );
-    const cachedLink = await StremThruService.playbackLinkCache.get(cacheKey);
+    const forceRefresh = options?.forceRefresh === true;
+    const cachedLink = forceRefresh
+      ? undefined
+      : await StremThruService.playbackLinkCache.get(cacheKey);
 
-    if (cachedLink !== undefined) {
+    if (forceRefresh) {
+      logger.debug(`Bypassing cached usenet playback link for fresh resolve`, {
+        service: this.serviceName,
+        hash: hash.slice(0, 10),
+      });
+    } else if (cachedLink !== undefined) {
       logger.debug(`Using cached link for ${nzb || hash}`);
       if (cachedLink === null) {
         if (!cacheAndPlay) {

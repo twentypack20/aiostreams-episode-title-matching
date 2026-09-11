@@ -370,6 +370,50 @@ export function mergeParsedMediaInfo(
   return merged;
 }
 
+/**
+ * Merge release/filename-derived media info with media information obtained
+ * from the actual provider/container.  When the provider supplied a non-empty
+ * value for a field, that field is authoritative instead of being unioned with
+ * filename guesses.  This is especially important for audio languages: a
+ * release tagged "Dual Audio" must not keep a guessed English language when
+ * the real container reports only Japanese + Portuguese.
+ */
+export function mergeAuthoritativeParsedMediaInfo(
+  fallback: Partial<ParsedMediaInfo> | undefined,
+  authoritative: Partial<ParsedMediaInfo> | undefined
+): ParsedMediaInfo | undefined {
+  const fallbackInfo = normaliseParsedMediaInfo(fallback);
+  const authoritativeInfo = normaliseParsedMediaInfo(authoritative);
+
+  if (!fallbackInfo && !authoritativeInfo) return undefined;
+  if (!authoritativeInfo) return fallbackInfo;
+  if (!fallbackInfo) return authoritativeInfo;
+
+  return normaliseParsedMediaInfo({
+    languages: authoritativeInfo.languages?.length
+      ? authoritativeInfo.languages
+      : fallbackInfo.languages,
+    subtitles: authoritativeInfo.subtitles?.length
+      ? authoritativeInfo.subtitles
+      : fallbackInfo.subtitles,
+    audioTags: authoritativeInfo.audioTags?.length
+      ? authoritativeInfo.audioTags
+      : fallbackInfo.audioTags,
+    audioChannels: authoritativeInfo.audioChannels?.length
+      ? authoritativeInfo.audioChannels
+      : fallbackInfo.audioChannels,
+    visualTags: authoritativeInfo.visualTags?.length
+      ? authoritativeInfo.visualTags
+      : fallbackInfo.visualTags,
+    encode: authoritativeInfo.encode ?? fallbackInfo.encode,
+    resolution: authoritativeInfo.resolution ?? fallbackInfo.resolution,
+    duration: authoritativeInfo.duration ?? fallbackInfo.duration,
+    bitrate: authoritativeInfo.bitrate ?? fallbackInfo.bitrate,
+    hasChapters:
+      authoritativeInfo.hasChapters ?? fallbackInfo.hasChapters,
+  });
+}
+
 export function mergeParsedMediaInfos(
   ...infos: Array<Partial<ParsedMediaInfo> | undefined>
 ): ParsedMediaInfo | undefined {

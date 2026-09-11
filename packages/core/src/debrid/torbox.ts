@@ -23,6 +23,7 @@ import {
   TorrentDebridService,
   UsenetDebridService,
   DebridFailureCache,
+  ResolveOptions,
 } from './base.js';
 import { ParsedResult, parseTorrentTitle } from '@viren070/parse-torrent-title';
 
@@ -628,14 +629,16 @@ export class TorboxDebridService
     playbackInfo: PlaybackInfo,
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    options?: ResolveOptions
   ): Promise<string | undefined> {
     if (playbackInfo.type === 'torrent') {
       return this.stremthru.resolve(
         playbackInfo,
         filename,
         cacheAndPlay,
-        autoRemoveDownloads
+        autoRemoveDownloads,
+        options
       );
     }
     const { result } = await DistributedLock.getInstance().withLock(
@@ -646,14 +649,19 @@ export class TorboxDebridService
         filename,
         this.config.token,
         this.config.clientIp,
-        { cacheAndPlay, autoRemoveDownloads }
+        {
+          cacheAndPlay,
+          autoRemoveDownloads,
+          forceRefresh: options?.forceRefresh === true,
+        }
       ),
       () =>
         this._resolve(
           playbackInfo,
           filename,
           cacheAndPlay,
-          autoRemoveDownloads
+          autoRemoveDownloads,
+          options
         ),
       {
         timeout: cacheAndPlay ? this.maxWaitTime + this.pollInterval : 30000,
@@ -669,7 +677,8 @@ export class TorboxDebridService
     playbackInfo: PlaybackInfo & { type: 'usenet' },
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    options?: ResolveOptions
   ): Promise<string | undefined> {
     const { nzb, metadata, hash } = playbackInfo;
     const cacheKey = buildResolveKey(
@@ -680,10 +689,16 @@ export class TorboxDebridService
       this.config.token,
       this.config.clientIp
     );
-    const cachedLink =
-      await TorboxDebridService.playbackLinkCache.get(cacheKey);
+    const forceRefresh = options?.forceRefresh === true;
+    const cachedLink = forceRefresh
+      ? undefined
+      : await TorboxDebridService.playbackLinkCache.get(cacheKey);
 
-    if (cachedLink !== undefined) {
+    if (forceRefresh) {
+      logger.debug(`Bypassing cached TorBox usenet playback link for fresh resolve`, {
+        hash: hash.slice(0, 10),
+      });
+    } else if (cachedLink !== undefined) {
       logger.debug(`Using cached link for ${nzb}`);
       if (cachedLink === null) {
         if (!cacheAndPlay) {

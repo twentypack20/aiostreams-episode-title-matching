@@ -1009,6 +1009,8 @@ export const ParsedStreamSchema = z.object({
   proxied: z.boolean().optional(),
   addon: AddonSchema,
   parsedFile: ParsedFileSchema.optional(),
+  /** Indicates that audio/video metadata came from the actual provider/container rather than release-name parsing. */
+  mediaInfoSource: z.enum(['provider', 'release']).optional(),
   message: z.string().max(1000).optional(),
   regexMatched: z
     .object({

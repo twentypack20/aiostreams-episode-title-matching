@@ -3,6 +3,7 @@ import {
   createLogger,
   getTimeTakenSincePoint,
   mergeParsedMediaInfos,
+  mergeAuthoritativeParsedMediaInfo,
   parseMediaInfo,
 } from '../../utils/index.js';
 import {
@@ -23,6 +24,9 @@ import {
   isUsenetDebridService,
   TitleMetadata,
   hashNzbUrl,
+  canLookupProviderMediaInfo,
+  lookupProviderMediaInfo,
+  providerMediaInfoConfig,
 } from '../../debrid/index.js';
 import { parseTorrentTitle, ParsedResult } from '@viren070/parse-torrent-title';
 import {
@@ -471,12 +475,27 @@ async function processTorrentsForDebridService(
       : { name: torrent.title, size: torrent.size, index: -1 };
 
     if (file) {
-      const parsedMediaInfo = stripSubtitleLanguagesFromAudioLanguages(
-        mergeParsedMediaInfos(parseMediaInfo(file.mediaInfo), torrent.parsedMediaInfo),
-        file.name,
-        torrent.title,
-        magnetCheckResult?.name
-      );
+      const authoritativeMediaInfo = parseMediaInfo(file.mediaInfo);
+      const parsedMediaInfo = authoritativeMediaInfo
+        ? mergeAuthoritativeParsedMediaInfo(
+            torrent.parsedMediaInfo,
+            authoritativeMediaInfo
+          )
+        : stripSubtitleLanguagesFromAudioLanguages(
+            torrent.parsedMediaInfo,
+            file.name,
+            torrent.title,
+            magnetCheckResult?.name
+          );
+
+      if (authoritativeMediaInfo?.languages?.length) {
+        logger.debug('Using provider/container audio languages as authoritative', {
+          service: service.id,
+          filename: file.name,
+          providerLanguages: authoritativeMediaInfo.languages,
+          releaseLanguages: torrent.parsedMediaInfo?.languages,
+        });
+      }
 
       results.push({
         ...torrent,
@@ -485,6 +504,8 @@ async function processTorrentsForDebridService(
         indexer: torrent.library ? undefined : torrent.indexer,
         file,
         parsedMediaInfo,
+        authoritativeMediaInfo,
+        providerItemId: magnetCheckResult?.id,
         service: {
           id: service.id,
           cached:
@@ -494,6 +515,43 @@ async function processTorrentsForDebridService(
         },
       });
     }
+  }
+
+  // StremThru normally supplies actual media_info directly on the selected
+  // file. If it does not, optionally ask the underlying provider for media
+  // metadata. The lookup is deliberately capped and concurrent so a missing
+  // metadata field cannot turn normal stream discovery into a serial API crawl.
+  if (providerMediaInfoConfig.enabled && providerMediaInfoConfig.limit > 0) {
+    const candidates = results
+      .filter(
+        (result) =>
+          !result.authoritativeMediaInfo &&
+          canLookupProviderMediaInfo({
+            serviceId: service.id,
+            downloadId: result.providerItemId,
+            file: result.file,
+          })
+      )
+      .slice(0, providerMediaInfoConfig.limit);
+
+    await Promise.all(
+      candidates.map(async (result) => {
+        const authoritativeMediaInfo = await lookupProviderMediaInfo({
+          serviceId: service.id,
+          token: service.credential,
+          hash: result.hash,
+          downloadId: result.providerItemId,
+          file: result.file,
+        });
+        if (!authoritativeMediaInfo) return;
+
+        result.authoritativeMediaInfo = authoritativeMediaInfo;
+        result.parsedMediaInfo = mergeAuthoritativeParsedMediaInfo(
+          result.parsedMediaInfo,
+          authoritativeMediaInfo
+        );
+      })
+    );
   }
 
   logger.debug(`Finished processing of torrents`, {
@@ -841,12 +899,23 @@ async function processNZBsForDebridService(
       : { name: nzb.title, size: nzb.size, index: -1 };
 
     if (file) {
+      const authoritativeMediaInfo = parseMediaInfo(file.mediaInfo);
+      const parsedMediaInfo = authoritativeMediaInfo
+        ? mergeAuthoritativeParsedMediaInfo(
+            nzb.parsedMediaInfo,
+            authoritativeMediaInfo
+          )
+        : nzb.parsedMediaInfo;
+
       results.push({
         ...nzb,
         title: nzb.title ?? nzbCheckResult?.name,
         size: nzbCheckResult?.size || nzb.size,
         indexer: nzb.library ? undefined : nzb.indexer,
         file,
+        parsedMediaInfo,
+        authoritativeMediaInfo,
+        providerItemId: nzbCheckResult?.id,
         service: {
           id: service.id,
           cached:

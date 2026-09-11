@@ -112,7 +112,11 @@ export function buildResolveKey(
   filename: string,
   credential: string,
   clientIp?: string,
-  flags?: { cacheAndPlay?: boolean; autoRemoveDownloads?: boolean }
+  flags?: {
+    cacheAndPlay?: boolean;
+    autoRemoveDownloads?: boolean;
+    forceRefresh?: boolean;
+  }
 ): string {
   const { type, hash, fileIndex } = playbackInfo;
   const nzb = playbackInfo.type === 'usenet' ? playbackInfo.nzb : undefined;
@@ -134,6 +138,7 @@ export function buildResolveKey(
   if (flags !== undefined) {
     parts.push(String(flags.cacheAndPlay ?? '-'));
     parts.push(String(flags.autoRemoveDownloads ?? '-'));
+    parts.push(String(flags.forceRefresh ?? '-'));
   }
   return parts.join(':');
 }
@@ -192,6 +197,10 @@ export interface NZB extends BaseFile {
 
 export interface TorrentWithSelectedFile extends Torrent {
   file: DebridFile;
+  /** Media information read from the actual provider/container, not filename tags. */
+  authoritativeMediaInfo?: ParsedMediaInfo;
+  /** Provider item id used only for optional provider media-info lookups. */
+  providerItemId?: string | number;
   service?: {
     id: BuiltinServiceId;
     cached: boolean;
@@ -202,6 +211,10 @@ export interface TorrentWithSelectedFile extends Torrent {
 
 export interface NZBWithSelectedFile extends NZB {
   file: DebridFile;
+  /** Media information read from the actual provider/container, not filename tags. */
+  authoritativeMediaInfo?: ParsedMediaInfo;
+  /** Provider item id used only for optional provider media-info lookups. */
+  providerItemId?: string | number;
   service?: {
     id: BuiltinServiceId;
     cached: boolean;

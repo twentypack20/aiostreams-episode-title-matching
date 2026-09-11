@@ -7,6 +7,7 @@ import {
   encryptString,
   BuiltinServiceId,
   mergeParsedMediaInfos,
+  mergeAuthoritativeParsedMediaInfo,
 } from '../utils/index.js';
 import {
   Torrent,
@@ -594,15 +595,36 @@ async function buildDebridStreams(
         },
       };
 
-      const parsedMediaInfo = stripSubtitleLanguagesFromAudioLanguages(
-        mergeParsedMediaInfos(original?.parsedFile, result.parsedMediaInfo),
-        result.file.name,
-        result.title,
-        original?.filename,
-        original?.folderName,
-        original?.originalName
+      const releaseMergedMediaInfo = mergeParsedMediaInfos(
+        original?.parsedFile,
+        result.parsedMediaInfo
       );
-      if (result.parsedMediaInfo && parsedMediaInfo) {
+      const parsedMediaInfo = result.authoritativeMediaInfo
+        ? mergeAuthoritativeParsedMediaInfo(
+            releaseMergedMediaInfo,
+            result.authoritativeMediaInfo
+          )
+        : stripSubtitleLanguagesFromAudioLanguages(
+            releaseMergedMediaInfo,
+            result.file.name,
+            result.title,
+            original?.filename,
+            original?.folderName,
+            original?.originalName
+          );
+      if (result.authoritativeMediaInfo) {
+        debridStream.mediaInfoSource = 'provider';
+        logger.debug('Applied authoritative provider/container media info', {
+          service: result.service?.id,
+          filename: result.file.name,
+          languages: result.authoritativeMediaInfo.languages,
+        });
+      }
+
+      if (
+        (result.parsedMediaInfo || result.authoritativeMediaInfo) &&
+        parsedMediaInfo
+      ) {
         debridStream.parsedFile = {
           ...debridStream.parsedFile,
           ...parsedMediaInfo,

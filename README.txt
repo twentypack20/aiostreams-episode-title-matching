@@ -226,3 +226,18 @@ To disable Trakt aliases explicitly:
 
   FETCH_TRAKT_ALIASES: "false"
 
+AIOStreams v7: actual audio metadata + fresh playback links
+----------------------------------------------------------
+See V7_PROVIDER_MEDIA_INFO_AND_FRESH_PLAYBACK.md for the complete behavior,
+configuration, deployment notes, and regression tests.
+
+Key defaults:
+  PROVIDER_MEDIA_INFO_LOOKUP=true
+  PROVIDER_MEDIA_INFO_LOOKUP_LIMIT=6
+  PROVIDER_MEDIA_INFO_TIMEOUT_MS=2500
+  PROVIDER_MEDIA_INFO_CACHE_TTL=86400
+  PLAYBACK_FORCE_FRESH_DEBRID_LINK=true
+
+When actual provider/container media metadata is present, its audio languages are
+authoritative over filename/release guesses. Native AIOStreams playback requests
+also force a fresh final debrid/CDN link on the real Stremio click by default.

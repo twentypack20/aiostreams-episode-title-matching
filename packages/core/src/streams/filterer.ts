@@ -1826,6 +1826,14 @@ class StreamFilterer {
       const languageSet = new Set(languages.map((lang) => lang.toLowerCase()));
       const originalLanguageLower = originalLanguage?.toLowerCase();
 
+      // Provider/container media info is stronger evidence than release-name
+      // heuristics. If the actual tracks say English is present, accept that as
+      // a strong English-audio signal; if it is absent, do not let a filename
+      // saying "Dual Audio" manufacture an English track.
+      if (stream.mediaInfoSource === 'provider') {
+        return languageSet.has('english');
+      }
+
       if (languageSet.has('dual audio') || languageSet.has('dubbed')) {
         return true;
       }
@@ -3677,6 +3685,18 @@ class StreamFilterer {
       url: string,
       redirectDepth: number = 0
     ): Promise<PreflightResult> => {
+      // Do not execute our own native playback route during server-side
+      // preflight. Resolving it here uses the VPS request context and can warm a
+      // temporary/IP-sensitive debrid link before the real Stremio client
+      // clicks it. Native playback already has playback-time retries and now
+      // generates a fresh final link on the real client request.
+      if (/\/api\/v1\/debrid\/playback\//i.test(url)) {
+        return {
+          status: 'passed',
+          reason: 'Native playback preflight skipped; fresh link will be generated on client click',
+        };
+      }
+
       if (redirectDepth > 3) {
         return {
           status: 'failed',
