@@ -446,6 +446,11 @@ class StreamFetcher {
         .flatMap((r) => r.statistic)
         .filter((s) => s !== undefined);
 
+      // Metadata is already fetching in parallel with the addon requests. Let
+      // a stale anime mapping recover before SeaDex and anime-only filtering
+      // evaluate this group.
+      await context.ensureAnimeClassification();
+
       // Run SeaDex precompute BEFORE filter so seadex() works in Included SEL
       // Now uses context's cached SeaDex data when available
       await this.precompute.precomputeSeaDexOnly(groupStreams, context);

@@ -350,6 +350,10 @@ class StreamFilterer {
     streams: ParsedStream[],
     context: StreamContext
   ): Promise<ParsedStream[]> {
+    // Defensive: callers outside StreamFetcher may invoke filter() directly.
+    // Ensure late metadata-based anime promotion is visible before capturing
+    // the request classification in local variables.
+    await context.ensureAnimeClassification();
     const { type, id, parsedId, isAnime } = context;
     const episodeTitleDebug = process.env.EPISODE_TITLE_DEBUG === 'true';
     const boolEnv = (value: string | undefined): boolean =>

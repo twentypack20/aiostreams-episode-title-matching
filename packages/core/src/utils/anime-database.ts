@@ -89,6 +89,17 @@ const DATA_SOURCES = {
     },
     dataKey: 'animeListById',
   },
+  animeApi: {
+    name: 'AnimeApi (nattadasu)',
+    url: 'https://raw.githubusercontent.com/nattadasu/animeApi/refs/heads/v3/database/animeapi.json',
+    filePath: path.join(ANIME_DATABASE_PATH, 'animeapi.json'),
+    etagPath: path.join(ANIME_DATABASE_PATH, 'animeapi.etag'),
+    loader: 'loadAnimeApi',
+    get refreshInterval() {
+      return appConfig.metadata.animeDb.refresh.animeApi * 1000;
+    },
+    dataKey: 'animeApiMappingsById',
+  },
 } as const;
 
 const extractIdFromUrl: {
@@ -198,6 +209,46 @@ interface MappingEntry {
         tmdb?: number;
       }
     | undefined;
+  /**
+   * Hints that exist only in nattadasu/animeApi. Keep these separate from the
+   * public mappings block because season numbers from different providers are
+   * not interchangeable for split-cour anime.
+   */
+  animeApi?: {
+    title?: string;
+    tmdbSeasonId?: number;
+    tvdbSeasonId?: number;
+    traktSeason?: number;
+    traktSeasonId?: number;
+    traktSlug?: string;
+    traktType?: 'movies' | 'shows';
+    traktMayInvalid?: boolean;
+  };
+}
+
+interface AnimeApiRaw {
+  title?: string;
+  anidb?: number | null;
+  anilist?: number | null;
+  animeplanet?: string | null;
+  anisearch?: number | null;
+  imdb?: string | null;
+  kitsu?: number | null;
+  livechart?: number | null;
+  myanimelist?: number | null;
+  notify?: string | null;
+  simkl?: number | null;
+  themoviedb?: number | null;
+  themoviedb_season_id?: number | null;
+  themoviedb_type?: 'movie' | 'tv' | null;
+  thetvdb?: number | null;
+  thetvdb_season_id?: number | null;
+  trakt?: number | null;
+  trakt_may_invalid?: boolean | null;
+  trakt_season?: number | null;
+  trakt_season_id?: number | null;
+  trakt_slug?: string | null;
+  trakt_type?: 'movies' | 'shows' | null;
 }
 
 interface ManamiEntry {
@@ -323,7 +374,7 @@ interface AnimeListEntry {
 }
 
 export interface AnimeEntry {
-  mappings?: Omit<MappingEntry, 'type'>;
+  mappings?: Omit<MappingEntry, 'type' | 'animeApi'>;
   type: AnimeType;
   imdb?: {
     seasonNumber?: number;
@@ -411,6 +462,67 @@ function validateMappingEntry(data: any): MappingEntry | null {
   }
 
   return entry;
+}
+
+function validateAnimeApiEntry(data: AnimeApiRaw): MappingEntry | null {
+  if (!data || typeof data !== 'object') return null;
+
+  const numberOrUndefined = (value: unknown): number | undefined => {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && /^\d+$/.test(value)) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    }
+    return undefined;
+  };
+  const stringOrUndefined = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.trim() ? value.trim() : undefined;
+
+  let type = AnimeType.UNKNOWN;
+  if (data.themoviedb_type === 'movie' || data.trakt_type === 'movies') {
+    type = AnimeType.MOVIE;
+  } else if (data.themoviedb_type === 'tv' || data.trakt_type === 'shows') {
+    type = AnimeType.TV;
+  }
+
+  const entry: MappingEntry = {
+    animePlanetId: stringOrUndefined(data.animeplanet),
+    anidbId: numberOrUndefined(data.anidb),
+    anilistId: numberOrUndefined(data.anilist),
+    anisearchId: numberOrUndefined(data.anisearch),
+    imdbId: stringOrUndefined(data.imdb),
+    kitsuId: numberOrUndefined(data.kitsu),
+    livechartId: numberOrUndefined(data.livechart),
+    malId: numberOrUndefined(data.myanimelist),
+    notifyMoeId: stringOrUndefined(data.notify),
+    simklId: numberOrUndefined(data.simkl),
+    themoviedbId: numberOrUndefined(data.themoviedb),
+    thetvdbId: numberOrUndefined(data.thetvdb),
+    traktId: numberOrUndefined(data.trakt),
+    type,
+    animeApi: {
+      title: stringOrUndefined(data.title),
+      tmdbSeasonId: numberOrUndefined(data.themoviedb_season_id),
+      tvdbSeasonId: numberOrUndefined(data.thetvdb_season_id),
+      traktSeason: numberOrUndefined(data.trakt_season),
+      traktSeasonId: numberOrUndefined(data.trakt_season_id),
+      traktSlug: stringOrUndefined(data.trakt_slug),
+      traktType:
+        data.trakt_type === 'movies' || data.trakt_type === 'shows'
+          ? data.trakt_type
+          : undefined,
+      traktMayInvalid:
+        typeof data.trakt_may_invalid === 'boolean'
+          ? data.trakt_may_invalid
+          : undefined,
+    },
+  };
+
+  // Ignore records that carry no identifier usable by AIOStreams.
+  const hasAnyId = ID_TYPES.some(
+    (idType) => entry[idType] !== undefined && entry[idType] !== null
+  );
+  return hasAnyId ? entry : null;
 }
 
 function validateManamiEntry(data: any): ManamiEntry | null {
@@ -655,6 +767,7 @@ export class AnimeDatabase {
 
   private dataStore: {
     fribbMappingsById: MappingIdMap;
+    animeApiMappingsById: MappingIdMap;
     manamiById: ManamiIdMap;
     kitsuById: KitsuIdMap;
     extendedAnitraktMoviesById: ExtendedAnitraktMoviesIdMap;
@@ -663,6 +776,7 @@ export class AnimeDatabase {
     animeListByTvdbId: AnimeListByTvdbIdMap;
   } = {
     fribbMappingsById: new Map(),
+    animeApiMappingsById: new Map(),
     manamiById: new Map(),
     kitsuById: new Map(),
     extendedAnitraktMoviesById: new Map(),
@@ -745,10 +859,20 @@ export class AnimeDatabase {
     const getFromMap = <T>(map: Map<any, T> | undefined, key: any) =>
       map?.get(key) || map?.get(key.toString()) || map?.get(Number(key));
 
-    let mappingsList = getFromMap(
-      this.dataStore.fribbMappingsById.get(idType),
-      idValue
-    );
+    const fribbMappings =
+      getFromMap(this.dataStore.fribbMappingsById.get(idType), idValue) ?? [];
+    const animeApiMappings =
+      getFromMap(this.dataStore.animeApiMappingsById.get(idType), idValue) ??
+      [];
+
+    // Keep the legacy Fribb candidates first so established mappings retain
+    // their old fallback order. AnimeApi augments the candidate set with newer
+    // seasons and provider-specific season IDs instead of replacing it.
+    let mappingsList: MappingEntry[] | undefined = [
+      ...fribbMappings,
+      ...animeApiMappings,
+    ];
+    if (mappingsList.length === 0) mappingsList = undefined;
 
     mappingsList = this.filterMappingsBySeasonType(mappingsList, season);
 
@@ -858,7 +982,7 @@ export class AnimeDatabase {
       return {};
     }
 
-    if (mappingsList.length === 1) {
+    if (mappingsList.length === 1 && season === undefined) {
       return {
         mappings: mappingsList[0],
         details: this.findManamiDetailsFromMapping(mappingsList[0]),
@@ -1014,16 +1138,44 @@ export class AnimeDatabase {
       }
     }
 
+    // Last-resort season hint from the actively maintained AnimeApi dataset.
+    // Trakt season numbering is a different coordinate system from IMDb/TMDB/
+    // TVDB for some split-cour shows, so only use an exact, explicitly valid
+    // hint after the legacy Kitsu/AnimeList/synonym signals failed. Records
+    // flagged trakt_may_invalid are intentionally not trusted here.
+    const animeApiSeasonMatches = mappingsList.filter(
+      (mapping) =>
+        mapping.animeApi?.traktMayInvalid !== true &&
+        mapping.animeApi?.traktSeason === season
+    );
+    if (animeApiSeasonMatches.length > 0) {
+      const mapping = animeApiSeasonMatches[0];
+      logger.debug(
+        {
+          id: `${idType}:${idValue}`,
+          seasonEpisode: `S${season}E${episode}`,
+          anidbId: mapping.anidbId,
+          malId: mapping.malId,
+          traktSeason: mapping.animeApi?.traktSeason,
+        },
+        'selected AnimeApi season fallback'
+      );
+      return {
+        mappings: mapping,
+        details: this.findManamiDetailsFromMapping(mapping),
+      };
+    }
+
     return {};
   }
 
-  /**
-   * Convert IMDB ID to TVDB ID using Fribb mappings
-   */
+  /** Convert IMDB ID to TVDB ID using all loaded relation mappings. */
   private getTvdbIdFromImdbId(imdbId: string): number | null {
-    const imdbMappings = this.dataStore.fribbMappingsById
-      .get('imdbId')
-      ?.get(imdbId);
+    const imdbMappings = [
+      ...(this.dataStore.fribbMappingsById.get('imdbId')?.get(imdbId) ?? []),
+      ...(this.dataStore.animeApiMappingsById.get('imdbId')?.get(imdbId) ??
+        []),
+    ];
     if (!imdbMappings || imdbMappings.length === 0) return null;
 
     // Return the first TVDB ID found in mappings
@@ -1129,6 +1281,7 @@ export class AnimeDatabase {
     const {
       type,
       season: mappingSeasonInfo,
+      animeApi: animeApiHints,
       ...finalMappings
     } = combinedMappings;
     const traktExternalSeasonInfo = tvAnitraktEntry?.trakt?.season?.externals;
@@ -1153,12 +1306,14 @@ export class AnimeDatabase {
       mappings: finalMappings,
       tmdb: {
         seasonNumber: tmdbSeasonNumber,
-        seasonId: traktExternalSeasonInfo?.tmdb ?? null,
+        seasonId:
+          traktExternalSeasonInfo?.tmdb ?? animeApiHints?.tmdbSeasonId ?? null,
         fromEpisode: tmdbFromEpisode,
       },
       tvdb: {
         seasonNumber: tvdbSeasonNumber,
-        seasonId: traktExternalSeasonInfo?.tvdb ?? null,
+        seasonId:
+          traktExternalSeasonInfo?.tvdb ?? animeApiHints?.tvdbSeasonId ?? null,
         fromEpisode: tvdbFromEpisode,
       },
       imdb: kitsuEntry
@@ -1185,9 +1340,18 @@ export class AnimeDatabase {
               title: movieAnitraktEntry.trakt.title,
               slug: movieAnitraktEntry.trakt.slug,
             }
+          : animeApiHints?.traktSlug &&
+              (animeApiHints.title || details?.title)
+            ? {
+                title: animeApiHints.title ?? details!.title,
+                slug: animeApiHints.traktSlug,
+                seasonId: animeApiHints.traktSeasonId ?? null,
+                seasonNumber: animeApiHints.traktSeason ?? null,
+              }
           : null,
       type: type,
       ...details,
+      title: details?.title ?? animeApiHints?.title,
       episodeMappings: animeListEntry?.mappings,
     };
   }
@@ -1324,6 +1488,53 @@ export class AnimeDatabase {
         timeTaken: getTimeTakenSincePoint(start),
       },
       'loaded and indexed valid entries'
+    );
+  }
+
+  private async loadAnimeApi(): Promise<void> {
+    const start = Date.now();
+    const fileContents = await this.readLocalFile(DATA_SOURCES.animeApi.filePath);
+    if (!fileContents)
+      throw new Error(DATA_SOURCES.animeApi.name + ' file not found');
+
+    const data = JSON.parse(fileContents);
+    if (!Array.isArray(data))
+      throw new Error(DATA_SOURCES.animeApi.name + ' data must be an array');
+
+    const newMappingsById: MappingIdMap = new Map();
+    for (const idType of ID_TYPES) {
+      newMappingsById.set(idType, new Map());
+    }
+
+    let validEntries = 0;
+    let invalidEntries = 0;
+    for (const rawEntry of data as AnimeApiRaw[]) {
+      const entry = validateAnimeApiEntry(rawEntry);
+      if (!entry) {
+        invalidEntries++;
+        continue;
+      }
+      validEntries++;
+      for (const idType of ID_TYPES) {
+        const idValue = entry[idType];
+        if (idValue === undefined || idValue === null) continue;
+        const idMap = newMappingsById.get(idType);
+        if (!idMap) continue;
+        const existingEntries = idMap.get(idValue) ?? [];
+        existingEntries.push(entry);
+        idMap.set(idValue, existingEntries);
+      }
+    }
+
+    this.dataStore.animeApiMappingsById = newMappingsById;
+    logger.info(
+      {
+        source: DATA_SOURCES.animeApi.name,
+        entries: validEntries,
+        skipped: invalidEntries,
+        timeTaken: getTimeTakenSincePoint(start),
+      },
+      'loaded and indexed AnimeApi relation mappings'
     );
   }
 

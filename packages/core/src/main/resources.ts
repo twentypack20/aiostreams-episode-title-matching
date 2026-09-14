@@ -250,6 +250,8 @@ export async function processStreams(
   let limitMs = 0;
   let selMs = 0;
 
+  await context.ensureAnimeClassification();
+
   if (isMeta) {
     await ctx.precomputer.precomputeSeaDexOnly(processedStreams, context);
     const metaFilterStart = Date.now();

@@ -17,6 +17,26 @@ import { iso6391ToLanguage } from '../utils/languages.js';
 
 const logger = createLogger('stream-context');
 
+type AnimeClassificationSource =
+  | 'kitsu-id'
+  | 'anime-database'
+  | 'anime-database-metadata-id'
+  | 'metadata-fallback'
+  | 'none';
+
+function metadataStronglyIndicatesAnime(metadata: Metadata): boolean {
+  const originalLanguage = metadata.originalLanguage?.trim().toLowerCase();
+  const isJapanese =
+    originalLanguage === 'ja' ||
+    originalLanguage === 'jpn' ||
+    originalLanguage === 'japanese';
+  const hasAnimationGenre =
+    metadata.genres?.some(
+      (genre) => genre.trim().toLowerCase() === 'animation'
+    ) ?? false;
+  return isJapanese && hasAnimationGenre;
+}
+
 /**
  * Extended metadata that includes additional fields computed during context build
  */
@@ -73,10 +93,24 @@ export class StreamContext {
   public readonly id: string;
   public readonly parsedId: ParsedId | null;
 
-  // Anime-related data (cached from AnimeDatabase)
-  public readonly isAnime: boolean;
-  public readonly animeEntry: AnimeEntry | null;
-  public readonly queryType: string; // 'anime.movie', 'anime.series', 'movie', 'series'
+  // Anime classification may be promoted after metadata arrives when a fresh
+  // season is not present in the local relation database yet.
+  private _isAnime: boolean;
+  private _animeEntry: AnimeEntry | null;
+  private _queryType: string;
+  private _animeClassificationSource: AnimeClassificationSource;
+
+  public get isAnime(): boolean {
+    return this._isAnime;
+  }
+
+  public get animeEntry(): AnimeEntry | null {
+    return this._animeEntry;
+  }
+
+  public get queryType(): string {
+    return this._queryType;
+  }
 
   // Metadata (fetched from TMDB/TVDB/IMDB)
   private _metadata: ExtendedMetadata | undefined;
@@ -116,15 +150,17 @@ export class StreamContext {
       isAnime: boolean;
       animeEntry: AnimeEntry | null;
       queryType: string;
+      animeClassificationSource: AnimeClassificationSource;
     }
   ) {
     this.type = type;
     this.id = id;
     this.userData = userData;
     this.parsedId = options.parsedId;
-    this.isAnime = options.isAnime;
-    this.animeEntry = options.animeEntry;
-    this.queryType = options.queryType;
+    this._isAnime = options.isAnime;
+    this._animeEntry = options.animeEntry;
+    this._queryType = options.queryType;
+    this._animeClassificationSource = options.animeClassificationSource;
   }
 
   /**
@@ -139,12 +175,11 @@ export class StreamContext {
     const start = Date.now();
     const parsedId = IdParser.parse(id, type);
     let isAnime = id.startsWith('kitsu');
+    let animeClassificationSource: AnimeClassificationSource = isAnime
+      ? 'kitsu-id'
+      : 'none';
 
     const animeDb = AnimeDatabase.getInstance();
-    if (animeDb.isAnime(id)) {
-      isAnime = true;
-    }
-
     let animeEntry: AnimeEntry | null = null;
     if (parsedId) {
       animeEntry = animeDb.getEntryById(
@@ -157,6 +192,11 @@ export class StreamContext {
             ? Number(parsedId.episode)
             : undefined
       );
+
+      if (animeEntry) {
+        isAnime = true;
+        animeClassificationSource = 'anime-database';
+      }
 
       // Enrich parsedId with anime entry data if available and no season specified
       if (animeEntry && !parsedId.season) {
@@ -172,6 +212,7 @@ export class StreamContext {
         type,
         isAnime,
         hasAnimeEntry: !!animeEntry,
+        animeClassificationSource,
         queryType,
         took: Date.now() - start,
       },
@@ -183,7 +224,99 @@ export class StreamContext {
       isAnime,
       animeEntry,
       queryType,
+      animeClassificationSource,
     });
+  }
+
+  private promoteAnimeClassification(
+    source: Exclude<AnimeClassificationSource, 'none'>,
+    animeEntry?: AnimeEntry | null
+  ): void {
+    const wasAnime = this._isAnime;
+    this._isAnime = true;
+    this._queryType = `anime.${this.type}`;
+    this._animeClassificationSource = source;
+    if (animeEntry) {
+      this._animeEntry = animeEntry;
+      if (this.parsedId && !this.parsedId.season) {
+        enrichParsedIdWithAnimeEntry(this.parsedId, animeEntry);
+      }
+    }
+
+    if (!wasAnime) {
+      logger.info(
+        {
+          id: this.id,
+          type: this.type,
+          source,
+          hasAnimeEntry: !!this._animeEntry,
+          queryType: this._queryType,
+        },
+        'promoted request to anime classification'
+      );
+    }
+  }
+
+  private promoteAnimeFromMetadata(metadata: Metadata): void {
+    if (this._isAnime) return;
+
+    const animeDb = AnimeDatabase.getInstance();
+    const season = this.parsedId?.season
+      ? Number(this.parsedId.season)
+      : undefined;
+    const episode = this.parsedId?.absoluteEpisode
+      ? Number(this.parsedId.absoluteEpisode)
+      : this.parsedId?.episode
+        ? Number(this.parsedId.episode)
+        : undefined;
+
+    const metadataIds: Array<[ParsedId['type'], number]> = [];
+    if (metadata.tmdbId) metadataIds.push(['themoviedbId', metadata.tmdbId]);
+    if (metadata.tvdbId) metadataIds.push(['thetvdbId', metadata.tvdbId]);
+
+    for (const [idType, idValue] of metadataIds) {
+      const animeEntry = animeDb.getEntryById(idType, idValue, season, episode);
+      if (animeEntry) {
+        this.promoteAnimeClassification(
+          'anime-database-metadata-id',
+          animeEntry
+        );
+        logger.debug(
+          { id: this.id, matchedId: `${idType}:${idValue}`, season, episode },
+          'anime classification recovered through metadata provider id'
+        );
+        return;
+      }
+    }
+
+    if (metadataStronglyIndicatesAnime(metadata)) {
+      this.promoteAnimeClassification('metadata-fallback');
+      logger.debug(
+        {
+          id: this.id,
+          title: metadata.title,
+          originalLanguage: metadata.originalLanguage,
+          genres: metadata.genres,
+        },
+        'anime classification recovered through conservative metadata fallback'
+      );
+    }
+  }
+
+  /**
+   * Wait for the already-started metadata fetch when the initial relation DB
+   * lookup missed. This gives newly released anime seasons one conservative
+   * second chance before anime-only filtering/ranking is evaluated.
+   */
+  public async ensureAnimeClassification(): Promise<void> {
+    if (!this._isAnime) {
+      await this.getMetadata();
+    }
+    if (this._isAnime) {
+      // startAllFetches() skips SeaDex when the initial classification is
+      // non-anime. Start it now if metadata promoted the request.
+      this.startSeaDexFetch();
+    }
   }
 
   /**
@@ -222,6 +355,13 @@ export class StreamContext {
           this.parsedId!,
           this.type as any
         );
+
+        // A fresh anime season can appear before one of the legacy relation
+        // datasets learns about it. First retry classification using the TMDB/
+        // TVDB IDs returned by metadata; then use a deliberately conservative
+        // Japanese + Animation fallback so anime-only safeguards do not silently
+        // switch off while mappings catch up.
+        this.promoteAnimeFromMetadata(metadata);
 
         // Calculate absolute episode for anime. Extended Kitsu bridge IDs carry
         // the provider/anime absolute episode explicitly; prefer that value.

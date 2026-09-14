@@ -255,3 +255,16 @@ remaining language gap for equivalent resolver copies of the same torrent file:
   - successful external resolver playback now has safe info-level diagnostics.
 
 No new environment variables are required.
+
+AIOStreams v7.2: anime classification freshness repair
+------------------------------------------------------
+See V7_2_ANIME_CLASSIFICATION.md.
+
+v7.2 preserves v7.1 and adds the current nattadasu/animeApi relation dataset as
+an additive anime-mapping source so newly released seasons do not silently lose
+anime-only safeguards. If relation mapping still misses, metadata can recover
+classification via TMDB/TVDB IDs or a conservative Japanese + Animation
+fallback before filtering/ranking.
+
+Default (no override required):
+  ANIME_DB_ANIMEAPI_REFRESH_INTERVAL=86400
