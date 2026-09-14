@@ -1522,6 +1522,19 @@ class StreamFilterer {
           const otherTitle = normaliseTitle(episodeInfo.title);
           if (!otherTitle) return false;
 
+          // Some metadata providers expose a special/episode whose title is
+          // literally the series title (or one of its aliases). That text is
+          // present in virtually every normal release filename, so it cannot
+          // safely identify a conflicting episode. Treat exact series-title
+          // episode names as non-discriminating and let season/episode markers,
+          // explicit special/OVA signals, and the other mismatch guards decide.
+          const isSeriesTitleOnly = requestTitles.some(
+            (seriesTitle) => seriesTitle === otherTitle
+          );
+          if (isSeriesTitleOnly) {
+            return false;
+          }
+
           const otherExact = episodeTitleCandidateForms.some((value) =>
             value.includes(otherTitle)
           );
