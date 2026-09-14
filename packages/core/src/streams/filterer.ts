@@ -864,8 +864,8 @@ class StreamFilterer {
       let streamTitle = stream.parsedFile?.title;
       if (
         titleMatchingOptions.requestTypes?.length &&
-        (!titleMatchingOptions.requestTypes.includes(type) ||
-          (isAnime && !titleMatchingOptions.requestTypes.includes('anime')))
+        ((isAnime && !titleMatchingOptions.requestTypes.includes('anime')) ||
+          (!isAnime && !titleMatchingOptions.requestTypes.includes(type)))
       ) {
         return true;
       }
@@ -979,8 +979,8 @@ class StreamFilterer {
 
       if (
         yearMatchingOptions.requestTypes?.length &&
-        (!yearMatchingOptions.requestTypes.includes(type) ||
-          (isAnime && !yearMatchingOptions.requestTypes.includes('anime')))
+        ((isAnime && !yearMatchingOptions.requestTypes.includes('anime')) ||
+          (!isAnime && !yearMatchingOptions.requestTypes.includes(type)))
       ) {
         return true;
       }
@@ -1095,9 +1095,10 @@ class StreamFilterer {
 
       if (
         seasonEpisodeMatchingOptions.requestTypes?.length &&
-        (!seasonEpisodeMatchingOptions.requestTypes.includes(type) ||
-          (isAnime &&
-            !seasonEpisodeMatchingOptions.requestTypes.includes('anime')))
+        ((isAnime &&
+          !seasonEpisodeMatchingOptions.requestTypes.includes('anime')) ||
+          (!isAnime &&
+            !seasonEpisodeMatchingOptions.requestTypes.includes(type)))
       ) {
         return true;
       }
@@ -1280,9 +1281,10 @@ class StreamFilterer {
 
       if (
         episodeTitleMatchingOptions.requestTypes?.length &&
-        (!episodeTitleMatchingOptions.requestTypes.includes(type) ||
-          (isAnime &&
-            !episodeTitleMatchingOptions.requestTypes.includes('anime')))
+        ((isAnime &&
+          !episodeTitleMatchingOptions.requestTypes.includes('anime')) ||
+          (!isAnime &&
+            !episodeTitleMatchingOptions.requestTypes.includes(type)))
       ) {
         logEpisodeTitleDebug('Episode title matching bypassed: request type not enabled', {
           filename: stream.filename,
