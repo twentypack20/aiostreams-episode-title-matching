@@ -1473,6 +1473,42 @@ class StreamFilterer {
       // the raw filename is a different OVA/special/spin-off. Run mismatch-only
       // raw-filename checks first, then allow requested episode title matches later.
 
+      // Compare a possible conflicting episode title against the requested episode
+      // title, rather than rejecting on any fuzzy match above the threshold. Anime
+      // franchises often have specials whose title is just the series name plus a
+      // number (for example, "Jujutsu Kaisen 0"). A normal episode filename such
+      // as "Jujutsu Kaisen S03E11..." can fuzzy-match that title very strongly
+      // even though it is clearly not the movie/special. Likewise, neighbouring
+      // episode titles such as "Part 4" and "Part 5" are intentionally similar.
+      //
+      // A different known episode title is therefore considered a conflict only when
+      // it is a better match than the requested title by a useful margin, or when the
+      // candidate literally contains that other title while not literally containing
+      // the requested one. Series-title + numeric-suffix specials require literal
+      // containment before they can conflict, preventing the franchise name alone
+      // from removing ordinary episodes.
+      const episodeTitleCandidateForms = [
+        normalisedCandidate,
+        normalisedPrimaryCandidate,
+        rawReleaseTitle,
+      ].filter((value) => value.length > 0);
+
+      const requestedEpisodeScore = Math.max(
+        ...episodeTitleCandidateForms.map(
+          (value) => partial_ratio(value, normalisedRequestedEpisodeTitle) / 100
+        )
+      );
+      const requestedEpisodeExact = episodeTitleCandidateForms.some((value) =>
+        value.includes(normalisedRequestedEpisodeTitle)
+      );
+
+      const isSeriesTitlePlusNumericSuffix = (episodeTitle: string) =>
+        requestTitles.some((seriesTitle) => {
+          if (!seriesTitle || !episodeTitle.startsWith(seriesTitle)) return false;
+          const remainder = episodeTitle.slice(seriesTitle.length);
+          return /^\d{1,4}$/.test(remainder);
+        });
+
       const conflictingTitle = requestedMetadata?.seasonEpisodeTitles?.find(
         (episodeInfo) => {
           if (!episodeInfo.title) return false;
@@ -1482,13 +1518,37 @@ class StreamFilterer {
           ) {
             return false;
           }
+
           const otherTitle = normaliseTitle(episodeInfo.title);
-          const otherScore = Math.max(
-            partial_ratio(normalisedCandidate, otherTitle) / 100,
-            partial_ratio(normalisedPrimaryCandidate, otherTitle) / 100,
-            partial_ratio(rawReleaseTitle, otherTitle) / 100
+          if (!otherTitle) return false;
+
+          const otherExact = episodeTitleCandidateForms.some((value) =>
+            value.includes(otherTitle)
           );
-          return otherScore >= threshold;
+
+          // Do not fuzzy-match a franchise-numbered special from the shared series
+          // name alone. An actual "Series 0" release will still be caught because
+          // its normalised filename literally contains the complete title.
+          if (isSeriesTitlePlusNumericSuffix(otherTitle) && !otherExact) {
+            return false;
+          }
+
+          const otherScore = Math.max(
+            ...episodeTitleCandidateForms.map(
+              (value) => partial_ratio(value, otherTitle) / 100
+            )
+          );
+
+          if (otherScore < threshold) return false;
+
+          if (otherExact && !requestedEpisodeExact) {
+            return true;
+          }
+
+          // Keep mismatch-only matching conservative. Closely related titles such
+          // as "Part 4" / "Part 5" should not remove the correct episode merely
+          // because both clear the similarity threshold. The other title must win.
+          return otherScore - requestedEpisodeScore >= 0.02;
         }
       );
 

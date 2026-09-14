@@ -268,3 +268,5 @@ fallback before filtering/ranking.
 
 Default (no override required):
   ANIME_DB_ANIMEAPI_REFRESH_INTERVAL=86400
+
+v7.2.2 continuation: fixes false-positive known-episode-title conflicts exposed by v7.2.1. Normal anime episode filenames that share the franchise name with a numbered special (for example Jujutsu Kaisen vs Jujutsu Kaisen 0) are no longer rejected from fuzzy overlap alone; neighbouring Part N titles are compared competitively against the requested title.
