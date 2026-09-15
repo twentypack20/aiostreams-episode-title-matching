@@ -94,6 +94,28 @@ const playbackFreshLinkConfig = {
   ),
 };
 
+const playbackCdnDiagnosticConfig = {
+  // Disabled by default. When enabled, real client playback resolves trigger a
+  // tiny delayed Range probe against the final CDN URL. The signed URL itself
+  // is never logged, and external-resolver preflight requests are excluded.
+  enabled: parseBooleanEnv(
+    process.env.PLAYBACK_CDN_DIAGNOSTIC_PROBE,
+    false
+  ),
+  timeoutMs: parseIntegerEnv(
+    process.env.PLAYBACK_CDN_DIAGNOSTIC_TIMEOUT_MS,
+    5_000,
+    500,
+    30_000
+  ),
+  delayMs: parseIntegerEnv(
+    process.env.PLAYBACK_CDN_DIAGNOSTIC_DELAY_MS,
+    1_500,
+    0,
+    10_000
+  ),
+};
+
 const permanentResolveErrorCodes = new Set<DebridError['code']>([
   'BAD_REQUEST',
   'CONFLICT',
@@ -329,6 +351,105 @@ const cancelFetchBody = async (
   try {
     await response.body?.cancel();
   } catch {}
+};
+
+type PlaybackCdnDiagnosticRoute = 'external-resolver' | 'native-debrid';
+
+const getSafeFetchErrorCode = (error: unknown): string | undefined => {
+  if (!error || typeof error !== 'object') return undefined;
+
+  const directCode = (error as { code?: unknown }).code;
+  if (typeof directCode === 'string' || typeof directCode === 'number') {
+    return String(directCode);
+  }
+
+  const cause = (error as { cause?: unknown }).cause;
+  if (!cause || typeof cause !== 'object') return undefined;
+  const causeCode = (cause as { code?: unknown }).code;
+  if (typeof causeCode === 'string' || typeof causeCode === 'number') {
+    return String(causeCode);
+  }
+
+  return undefined;
+};
+
+const probePlaybackCdnUrl = async (
+  finalUrl: string,
+  provider: string,
+  route: PlaybackCdnDiagnosticRoute
+): Promise<void> => {
+  if (!playbackCdnDiagnosticConfig.enabled) return;
+
+  if (playbackCdnDiagnosticConfig.delayMs > 0) {
+    await sleep(playbackCdnDiagnosticConfig.delayMs);
+  }
+
+  let finalHost = 'unknown';
+  try {
+    finalHost = new URL(finalUrl).host;
+  } catch {}
+
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    playbackCdnDiagnosticConfig.timeoutMs
+  );
+
+  try {
+    const response = await fetch(finalUrl, {
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-1',
+        'Accept-Encoding': 'identity',
+        'User-Agent': 'AIOStreams CDN diagnostic probe',
+      },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+
+    const headersMs = Date.now() - startedAt;
+    let responseHost = finalHost;
+    try {
+      responseHost = new URL(response.url).host;
+    } catch {}
+
+    const status = response.status;
+    const contentType = response.headers.get('content-type') ?? undefined;
+    const contentLength = response.headers.get('content-length') ?? undefined;
+    const contentRange = response.headers.get('content-range') ?? undefined;
+    const acceptRanges = response.headers.get('accept-ranges') ?? undefined;
+
+    await cancelFetchBody(response);
+
+    logger.info('Playback CDN diagnostic probe completed', {
+      provider,
+      route,
+      finalHost,
+      responseHost,
+      status,
+      ok: response.ok,
+      partialContent: status === 206,
+      headersMs,
+      timeoutMs: playbackCdnDiagnosticConfig.timeoutMs,
+      contentType,
+      contentLength,
+      contentRange,
+      acceptRanges,
+    });
+  } catch (error) {
+    logger.warn('Playback CDN diagnostic probe failed', {
+      provider,
+      route,
+      finalHost,
+      elapsedMs: Date.now() - startedAt,
+      timeoutMs: playbackCdnDiagnosticConfig.timeoutMs,
+      errorName: error instanceof Error ? error.name : typeof error,
+      errorCode: getSafeFetchErrorCode(error),
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 };
 
 const readFetchBodySnippet = async (
@@ -732,6 +853,16 @@ router.get(
             finalHost,
           });
 
+          const isResolverPreflight =
+            req.get('user-agent') === 'AIOStreams resolver preflight';
+          if (!isResolverPreflight) {
+            void probePlaybackCdnUrl(
+              finalUrl,
+              provider,
+              'external-resolver'
+            );
+          }
+
           if (attempt > 1) {
             logger.info('External resolver retry succeeded', {
               provider,
@@ -977,6 +1108,12 @@ router.get(
                 finalHost,
                 playbackType: currentPlaybackInfo.type,
               });
+
+              void probePlaybackCdnUrl(
+                result,
+                storeAuth.id,
+                'native-debrid'
+              );
             }
 
             if (attempt > 1) {

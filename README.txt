@@ -272,3 +272,5 @@ Default (no override required):
 v7.2.2 continuation: fixes false-positive known-episode-title conflicts exposed by v7.2.1. Normal anime episode filenames that share the franchise name with a numbered special (for example Jujutsu Kaisen vs Jujutsu Kaisen 0) are no longer rejected from fuzzy overlap alone; neighbouring Part N titles are compared competitively against the requested title.
 
 AIOStreams v7.2.3 continuation: ignores known episode/special titles that are exactly the series title (or one of its aliases) when checking for a conflicting episode title. This prevents ordinary filenames such as "Combatants Will Be Dispatched! - S01E02.mkv" from being rejected merely because metadata also contains a special/episode named "Combatants Will Be Dispatched!". Existing Jujutsu Kaisen 0 and neighbouring Part N protections remain active.
+
+v7.2.4 diagnostic probe: optional PLAYBACK_CDN_DIAGNOSTIC_PROBE performs a tiny delayed Range GET against freshly resolved final CDN URLs for real client playback only, logs host/status/timing/header metadata without logging signed URLs, and skips external-resolver preflight requests. Disabled by default.
