@@ -1994,6 +1994,20 @@ class StreamFilterer {
         .replace(/[^a-z0-9]+/g, ' ')
         .trim();
 
+    const formatLanguageRemovalEvidence = (
+      candidate: ParsedStream,
+      languages: string[] | undefined
+    ): string => {
+      const languageList = languages?.length
+        ? languages.join(', ')
+        : 'Unknown';
+      const evidenceLabel =
+        candidate.mediaInfoSource === 'provider'
+          ? 'Verified audio'
+          : 'Parser/source languages';
+      return `${evidenceLabel}: ${languageList}`;
+    };
+
     const hasStrongEnglishAudioSignal = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
       const languages = file?.languages ?? [];
@@ -2887,7 +2901,7 @@ class StreamFilterer {
       ) {
         this.incrementRemovalReason(
           'excludedLanguage',
-          file?.languages.length ? file.languages.join(', ') : 'Unknown'
+          formatLanguageRemovalEvidence(stream, file?.languages)
         );
         return false;
       }
@@ -2905,7 +2919,7 @@ class StreamFilterer {
       ) {
         this.incrementRemovalReason(
           'requiredLanguage',
-          file?.languages.length ? file.languages.join(', ') : 'Unknown'
+          formatLanguageRemovalEvidence(stream, file?.languages)
         );
         return false;
       }
@@ -2956,10 +2970,13 @@ class StreamFilterer {
         !skipLanguageFiltering &&
         shouldRejectLikelySubtitleOnlyEnglishAnime(stream)
       ) {
-        const langs = file?.languages.length ? file.languages.join(', ') : 'Unknown';
+        const languageEvidence = formatLanguageRemovalEvidence(
+          stream,
+          file?.languages
+        );
         this.incrementRemovalReason(
           'requiredLanguage',
-          `${langs} (English audio not confirmed; likely subtitle-only language tag)`
+          `${languageEvidence}\n      → English audio unconfirmed; likely subtitle/source metadata`
         );
         logEpisodeTitleDebug('Language filter rejected likely subtitle-only English anime stream', {
           filename: stream.filename,
@@ -2967,6 +2984,7 @@ class StreamFilterer {
           originalName: stream.originalName,
           parsedLanguages: file?.languages,
           parsedSubtitles: file?.subtitles,
+          mediaInfoSource: stream.mediaInfoSource ?? 'release',
           originalLanguage,
         });
         return false;

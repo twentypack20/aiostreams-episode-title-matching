@@ -274,3 +274,18 @@ v7.2.2 continuation: fixes false-positive known-episode-title conflicts exposed 
 AIOStreams v7.2.3 continuation: ignores known episode/special titles that are exactly the series title (or one of its aliases) when checking for a conflicting episode title. This prevents ordinary filenames such as "Combatants Will Be Dispatched! - S01E02.mkv" from being rejected merely because metadata also contains a special/episode named "Combatants Will Be Dispatched!". Existing Jujutsu Kaisen 0 and neighbouring Part N protections remain active.
 
 v7.2.4 diagnostic probe: optional PLAYBACK_CDN_DIAGNOSTIC_PROBE performs a tiny delayed Range GET against freshly resolved final CDN URLs for real client playback only, logs host/status/timing/header metadata without logging signed URLs, and skips external-resolver preflight requests. Disabled by default.
+
+AIOStreams v7.2.5: clearer language removal diagnostics
+-------------------------------------------------------
+v7.2.5 does not loosen or otherwise change language filtering. It only makes
+Removal Reasons distinguish actual provider/container audio evidence from
+release-name/parser language tags:
+  - provider/container metadata is labelled "Verified audio";
+  - filename/release parser output is labelled "Parser/source languages";
+  - anime entries rejected because English appears only as unverified source
+    metadata now explicitly say "English audio unconfirmed; likely
+    subtitle/source metadata".
+
+The v7.2.4 final-CDN diagnostic probe remains available in source and remains
+disabled by default. No CDN diagnostic environment variables are required for
+normal operation.
