@@ -377,6 +377,30 @@ const externalResolverConfig = {
   ),
 };
 
+type ExternalResolverMediaValidationCacheEntry = {
+  expiresAt: number;
+  mediaBytes?: number;
+  mediaSignature?: string;
+  reportedFileSize?: number;
+  probe2Start?: number;
+  probe2Bytes?: number;
+};
+
+const externalResolverMediaValidationSuccessCache = new Map<
+  string,
+  ExternalResolverMediaValidationCacheEntry
+>();
+const EXTERNAL_RESOLVER_MEDIA_VALIDATION_CACHE_TTL_MS = 10 * 60 * 1000;
+
+const getExternalResolverMediaValidationCacheKey = (
+  sourceUrl: string,
+  targetUrl: string,
+  expectedFileSize?: number
+): string =>
+  getSimpleTextHash(
+    `${sourceUrl}:${expectedFileSize ?? '-'}:${targetUrl}`
+  );
+
 const parseResponseRetryAfterMs = (
   response: Awaited<ReturnType<typeof fetch>>
 ): number | undefined => {
@@ -795,8 +819,64 @@ const resolveExternalResolverChain = async (
   expectedFileSize?: number
 ): Promise<string> => {
   let currentUrl = sourceUrl;
+  let validateDirectMediaTarget = false;
 
   for (let hop = 0; hop <= externalResolverConfig.maxHops; hop++) {
+    let directValidationCacheKey: string | undefined;
+    if (validateDirectMediaTarget) {
+      directValidationCacheKey = getExternalResolverMediaValidationCacheKey(
+        sourceUrl,
+        currentUrl,
+        expectedFileSize
+      );
+      const cachedValidation =
+        externalResolverMediaValidationSuccessCache.get(
+          directValidationCacheKey
+        );
+      if (cachedValidation && cachedValidation.expiresAt > Date.now()) {
+        let validationHost = 'unknown';
+        try {
+          validationHost = new URL(currentUrl).host;
+        } catch {}
+        logger.debug('External resolver media validation cache hit', {
+          host: validationHost,
+          expectedFileSize,
+          reportedFileSize: cachedValidation.reportedFileSize,
+          probe1Bytes: cachedValidation.mediaBytes,
+          signature: cachedValidation.mediaSignature,
+          probe2Start: cachedValidation.probe2Start,
+          probe2Bytes: cachedValidation.probe2Bytes,
+        });
+        logger.debug('External resolver media validation passed', {
+          host: validationHost,
+          expectedFileSize,
+          reportedFileSize: cachedValidation.reportedFileSize,
+          probe1Bytes: cachedValidation.mediaBytes,
+          signature: cachedValidation.mediaSignature,
+          probe2Start: cachedValidation.probe2Start,
+          probe2Bytes: cachedValidation.probe2Bytes,
+          cacheHit: true,
+        });
+        return currentUrl;
+      }
+      if (cachedValidation) {
+        externalResolverMediaValidationSuccessCache.delete(
+          directValidationCacheKey
+        );
+      }
+      if (externalResolverMediaValidationSuccessCache.size > 2000) {
+        const now = Date.now();
+        for (const [key, entry] of
+          externalResolverMediaValidationSuccessCache) {
+          if (entry.expiresAt <= now) {
+            externalResolverMediaValidationSuccessCache.delete(key);
+          }
+        }
+      }
+    }
+
+    const shouldRangeProbe =
+      validateDirectMediaTarget || isKnownExternalResolverHopUrl(currentUrl);
     const response = await fetch(currentUrl, {
       method: 'GET',
       redirect: 'manual',
@@ -805,7 +885,7 @@ const resolveExternalResolverChain = async (
         Accept:
           'video/*, audio/*, application/octet-stream, application/json, text/plain, */*;q=0.5',
         'User-Agent': 'AIOStreams external resolver playback',
-        ...(isKnownExternalResolverHopUrl(currentUrl)
+        ...(shouldRangeProbe
           ? { Range: `bytes=0-${externalResolverConfig.probeBytes - 1}` }
           : {}),
         ...(clientIp
@@ -832,11 +912,9 @@ const resolveExternalResolverChain = async (
         );
       }
       const targetUrl = parseHttpTarget(location, currentUrl);
-      if (isKnownExternalResolverHopUrl(targetUrl)) {
-        currentUrl = targetUrl;
-        continue;
-      }
-      return targetUrl;
+      currentUrl = targetUrl;
+      validateDirectMediaTarget = !isKnownExternalResolverHopUrl(targetUrl);
+      continue;
     }
 
     if ([408, 425, 500, 502, 503, 504].includes(status)) {
@@ -880,12 +958,13 @@ const resolveExternalResolverChain = async (
     }
 
     if (
+      validateDirectMediaTarget ||
       /^(video|audio)\//.test(contentType) ||
       /application\/(?:octet-stream|x-matroska|mp4|vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)/.test(
         contentType
       )
     ) {
-      if (isKnownExternalResolverHopUrl(currentUrl)) {
+      if (shouldRangeProbe) {
         try {
           const firstRange = parseContentRangeHeader(
             response.headers.get('content-range')
@@ -1122,6 +1201,22 @@ const resolveExternalResolverChain = async (
             }
           }
 
+          if (directValidationCacheKey) {
+            externalResolverMediaValidationSuccessCache.set(
+              directValidationCacheKey,
+              {
+                expiresAt:
+                  Date.now() +
+                  EXTERNAL_RESOLVER_MEDIA_VALIDATION_CACHE_TTL_MS,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                reportedFileSize: finalReportedFileSize,
+                probe2Start,
+                probe2Bytes: probe2BytesLength,
+              }
+            );
+          }
+
           logger.debug('External resolver media validation passed', {
             host: validationHost,
             expectedFileSize,
@@ -1130,6 +1225,7 @@ const resolveExternalResolverChain = async (
             signature: mediaSignature,
             probe2Start,
             probe2Bytes: probe2BytesLength,
+            cacheHit: false,
           });
         } catch (error) {
           if (error instanceof ExternalResolverError) throw error;
@@ -1180,21 +1276,19 @@ const resolveExternalResolverChain = async (
         const nested = findNestedResolverUrl(parsedJson);
         if (nested) {
           const targetUrl = parseHttpTarget(nested, currentUrl);
-          if (isKnownExternalResolverHopUrl(targetUrl)) {
-            currentUrl = targetUrl;
-            continue;
-          }
-          return targetUrl;
+          currentUrl = targetUrl;
+          validateDirectMediaTarget =
+            !isKnownExternalResolverHopUrl(targetUrl);
+          continue;
         }
       }
       const plainUrl = /^https?:\/\/\S+$/i.test(body) ? body : undefined;
       if (plainUrl) {
         const targetUrl = parseHttpTarget(plainUrl, currentUrl);
-        if (isKnownExternalResolverHopUrl(targetUrl)) {
-          currentUrl = targetUrl;
-          continue;
-        }
-        return targetUrl;
+        currentUrl = targetUrl;
+        validateDirectMediaTarget =
+          !isKnownExternalResolverHopUrl(targetUrl);
+        continue;
       }
       if (resolverErrorBodyPattern.test(body)) {
         throw new ExternalResolverError(

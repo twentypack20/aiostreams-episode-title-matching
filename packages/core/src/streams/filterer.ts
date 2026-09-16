@@ -4022,7 +4022,11 @@ class StreamFilterer {
     const classifyRedirectTarget = (
       sourceUrl: string,
       location: string
-    ): PreflightResult | { nestedResolverUrl: string } | undefined => {
+    ):
+      | PreflightResult
+      | { nestedResolverUrl: string }
+      | { mediaTargetUrl: string }
+      | undefined => {
       let target: URL;
       try {
         target = new URL(location, sourceUrl);
@@ -4075,25 +4079,23 @@ class StreamFilterer {
         };
       }
 
-      // Some resolver services chain through another resolver endpoint. Follow
-      // only resolver-to-resolver hops. Never follow the final media/CDN URL;
-      // downloading even one byte from the VPS can consume a temporary link or
-      // make a debrid provider see playback from the server IP instead of the
-      // Stremio client's IP.
+      // Resolver-to-resolver hops are followed as resolver URLs. A non-error
+      // redirect to a direct media/CDN URL must still be validated: v7.2.9
+      // performs the agreed two small Range probes against that actual target
+      // instead of treating the redirect itself as proof of playability.
       if (isResolverUrl(target.toString())) {
         return { nestedResolverUrl: target.toString() };
       }
 
-      // A non-error redirect to a direct URL means the resolver successfully
-      // produced a playback target. This is the furthest a server-side check can
-      // safely validate without actually playing the user's stream.
-      return { status: 'passed' };
+      return { mediaTargetUrl: target.toString() };
     };
 
     const inspectUrl = async (
       url: string,
       redirectDepth: number = 0,
-      expectedFileSize?: number
+      expectedFileSize?: number,
+      cacheIdentity?: string,
+      validateDirectMediaTarget: boolean = false
     ): Promise<PreflightResult> => {
       // Do not execute our own native playback route during server-side
       // preflight. Resolving it here uses the VPS request context and can warm a
@@ -4114,25 +4116,78 @@ class StreamFilterer {
         };
       }
 
+      let directValidationCacheKey: string | undefined;
+      if (validateDirectMediaTarget && cacheIdentity) {
+        directValidationCacheKey =
+          `${cacheIdentity}:${expectedFileSize ?? '-'}:${url}`;
+        const cachedValidation = resolverPreflightSuccessCache.get(
+          directValidationCacheKey
+        );
+        if (cachedValidation && cachedValidation.expiresAt > Date.now()) {
+          let validationHost = 'unknown';
+          try {
+            validationHost = new URL(url).host;
+          } catch {}
+          logger.debug('Resolver media validation cache hit', {
+            id,
+            host: validationHost,
+            expectedFileSize,
+            reportedFileSize: cachedValidation.reportedFileSize,
+            probe1Bytes: cachedValidation.mediaBytes,
+            signature: cachedValidation.mediaSignature,
+            probe2Start: cachedValidation.probe2Start,
+            probe2Bytes: cachedValidation.probe2Bytes,
+          });
+          logger.debug('Resolver media validation passed', {
+            id,
+            host: validationHost,
+            expectedFileSize,
+            reportedFileSize: cachedValidation.reportedFileSize,
+            probe1Bytes: cachedValidation.mediaBytes,
+            signature: cachedValidation.mediaSignature,
+            probe2Start: cachedValidation.probe2Start,
+            probe2Bytes: cachedValidation.probe2Bytes,
+            cacheHit: true,
+          });
+          return {
+            status: 'passed',
+            mediaBytes: cachedValidation.mediaBytes,
+            mediaSignature: cachedValidation.mediaSignature,
+            expectedFileSize,
+            reportedFileSize: cachedValidation.reportedFileSize,
+            probe2Start: cachedValidation.probe2Start,
+            probe2Bytes: cachedValidation.probe2Bytes,
+            cacheHit: true,
+          };
+        }
+        if (cachedValidation) {
+          resolverPreflightSuccessCache.delete(directValidationCacheKey);
+        }
+      }
+
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
       let probingResolverMediaBody = false;
 
       try {
         const resolverRoute = isResolverUrl(url);
+        const shouldRangeProbe =
+          validateDirectMediaTarget ||
+          (resolverRoute && isKnownExternalResolverHopUrl(url));
         const response = await fetch(url, {
           // Resolver routes need GET because AIOStreams intentionally rejects
-          // HEAD. Redirects are kept manual so error-video redirects can be
-          // classified and final debrid/CDN media is never downloaded here.
-          method: resolverRoute ? 'GET' : 'HEAD',
+          // HEAD. Final resolver-produced media targets also use GET with a
+          // bounded Range so the actual CDN object can be validated without
+          // downloading the stream.
+          method: resolverRoute || validateDirectMediaTarget ? 'GET' : 'HEAD',
           headers: {
             Accept:
               'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, application/json, text/plain, */*;q=0.5',
             'User-Agent': 'AIOStreams resolver preflight',
-            ...(resolverRoute && isKnownExternalResolverHopUrl(url)
+            ...(shouldRangeProbe
               ? { Range: `bytes=0-${resolverProbeBytes - 1}` }
               : {}),
-            ...(resolverRoute && this.userData.ip
+            ...((resolverRoute || validateDirectMediaTarget) && this.userData.ip
               ? {
                   'X-Forwarded-For': this.userData.ip,
                   'X-Real-IP': this.userData.ip,
@@ -4175,7 +4230,18 @@ class StreamFilterer {
             return inspectUrl(
               classified.nestedResolverUrl,
               redirectDepth + 1,
-              expectedFileSize
+              expectedFileSize,
+              cacheIdentity,
+              false
+            );
+          }
+          if ('mediaTargetUrl' in classified) {
+            return inspectUrl(
+              classified.mediaTargetUrl,
+              redirectDepth + 1,
+              expectedFileSize,
+              cacheIdentity,
+              true
             );
           }
           return classified;
@@ -4234,12 +4300,12 @@ class StreamFilterer {
           };
         }
 
-        if (isMediaContentType(contentType)) {
-          // v7.2.8: validate known external resolver media with two small Range
-          // probes instead of trusting a valid-looking prefix alone. The first
+        if (isMediaContentType(contentType) || validateDirectMediaTarget) {
+          // v7.2.9: validate both known resolver media and resolver-produced
+          // final CDN/media targets with two small Range probes. The first
           // probe validates the container and total size; the second proves the
           // server can serve bytes from deeper inside the same media object.
-          if (resolverRoute && isKnownExternalResolverHopUrl(url)) {
+          if (shouldRangeProbe) {
             probingResolverMediaBody = true;
             const firstRange = parseContentRange(
               response.headers.get('content-range')
@@ -4312,6 +4378,24 @@ class StreamFilterer {
             // HLS/DASH are manifests rather than one seekable media file, so a
             // second byte-range probe is not meaningful for those responses.
             if (manifestResponse) {
+              if (directValidationCacheKey) {
+                resolverPreflightSuccessCache.set(directValidationCacheKey, {
+                  expiresAt:
+                    Date.now() + RESOLVER_PREFLIGHT_SUCCESS_CACHE_TTL_MS,
+                  mediaBytes: bytes.length,
+                  mediaSignature,
+                  reportedFileSize,
+                });
+              }
+              logger.debug('Resolver media validation passed', {
+                id,
+                host: validationHost,
+                expectedFileSize,
+                reportedFileSize,
+                probe1Bytes: bytes.length,
+                signature: mediaSignature,
+                cacheHit: false,
+              });
               return {
                 status: 'passed',
                 mediaBytes: bytes.length,
@@ -4514,6 +4598,29 @@ class StreamFilterer {
               };
             }
 
+            if (directValidationCacheKey) {
+              resolverPreflightSuccessCache.set(directValidationCacheKey, {
+                expiresAt:
+                  Date.now() + RESOLVER_PREFLIGHT_SUCCESS_CACHE_TTL_MS,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                reportedFileSize: finalReportedFileSize,
+                probe2Start,
+                probe2Bytes: probe2Bytes.length,
+              });
+            }
+
+            logger.debug('Resolver media validation passed', {
+              id,
+              host: validationHost,
+              expectedFileSize,
+              reportedFileSize: finalReportedFileSize,
+              probe1Bytes: bytes.length,
+              signature: mediaSignature,
+              probe2Start,
+              probe2Bytes: probe2Bytes.length,
+              cacheHit: false,
+            });
             return {
               status: 'passed',
               mediaBytes: bytes.length,
@@ -4577,7 +4684,18 @@ class StreamFilterer {
                 return inspectUrl(
                   classified.nestedResolverUrl,
                   redirectDepth + 1,
-                  expectedFileSize
+                  expectedFileSize,
+                  cacheIdentity,
+                  false
+                );
+              }
+              if ('mediaTargetUrl' in classified) {
+                return inspectUrl(
+                  classified.mediaTargetUrl,
+                  redirectDepth + 1,
+                  expectedFileSize,
+                  cacheIdentity,
+                  true
                 );
               }
               return classified;
@@ -4597,7 +4715,18 @@ class StreamFilterer {
               return inspectUrl(
                 classified.nestedResolverUrl,
                 redirectDepth + 1,
-                expectedFileSize
+                expectedFileSize,
+                cacheIdentity,
+                false
+              );
+            }
+            if ('mediaTargetUrl' in classified) {
+              return inspectUrl(
+                classified.mediaTargetUrl,
+                redirectDepth + 1,
+                expectedFileSize,
+                cacheIdentity,
+                true
               );
             }
             return classified;
@@ -4616,8 +4745,9 @@ class StreamFilterer {
           };
         }
 
-        // A resolver that directly returns a non-text body has produced a
-        // stream response. Cancel immediately and do not inspect media bytes.
+        // Ordinary non-resolver direct URLs retain the legacy non-destructive
+        // behavior. Resolver-produced final media targets are handled above and
+        // must pass the two-Range validation before they can reach this point.
         try {
           await response.body?.cancel();
         } catch {}
@@ -4660,22 +4790,14 @@ class StreamFilterer {
     let nextIndex = 0;
     const workerCount = Math.min(concurrency, candidates.length);
 
-    const getPreflightCacheKey = (
-      stream: ParsedStream,
-      url: string,
-      expectedFileSize?: number
-    ): string => {
+    const getPreflightCacheIdentity = (stream: ParsedStream): string => {
       const service = stream.service?.id ?? 'unknown';
       const hash = stream.torrent?.infoHash?.toLowerCase();
       const fileIdx = stream.torrent?.fileIdx;
       const fileIdentity = hash
         ? `${hash}:${fileIdx ?? '-'}:${stream.filename ?? '-'}`
         : stream.filename ?? '-';
-
-      // Include the actual resolver target and the size expectation. A newly
-      // issued/changed resolver URL must not inherit a successful validation
-      // from a different target merely because it points at the same torrent.
-      return `${service}:${fileIdentity}:${expectedFileSize ?? '-'}:${url}`;
+      return `${service}:${fileIdentity}`;
     };
 
     const worker = async (): Promise<void> => {
@@ -4687,52 +4809,24 @@ class StreamFilterer {
         if (!url) continue;
 
         const expectedFileSize = getTrustedSelectedFileSize(stream);
-        const cacheKey = getPreflightCacheKey(
-          stream,
-          url,
-          expectedFileSize
-        );
-        const cachedValidation = resolverPreflightSuccessCache.get(cacheKey);
-        let preflightResult: PreflightResult;
+        const cacheIdentity = getPreflightCacheIdentity(stream);
 
-        if (cachedValidation && cachedValidation.expiresAt > Date.now()) {
-          preflightResult = {
-            status: 'passed',
-            mediaBytes: cachedValidation.mediaBytes,
-            mediaSignature: cachedValidation.mediaSignature,
-            expectedFileSize,
-            reportedFileSize: cachedValidation.reportedFileSize,
-            probe2Start: cachedValidation.probe2Start,
-            probe2Bytes: cachedValidation.probe2Bytes,
-            cacheHit: true,
-          };
-        } else {
-          if (cachedValidation) resolverPreflightSuccessCache.delete(cacheKey);
-          if (resolverPreflightSuccessCache.size > 2000) {
-            const now = Date.now();
-            for (const [key, entry] of resolverPreflightSuccessCache) {
-              if (entry.expiresAt <= now) {
-                resolverPreflightSuccessCache.delete(key);
-              }
+        if (resolverPreflightSuccessCache.size > 2000) {
+          const now = Date.now();
+          for (const [key, entry] of resolverPreflightSuccessCache) {
+            if (entry.expiresAt <= now) {
+              resolverPreflightSuccessCache.delete(key);
             }
           }
-          preflightResult = await inspectUrl(url, 0, expectedFileSize);
-          if (
-            preflightResult.status === 'passed' &&
-            (preflightResult.mediaSignature ||
-              preflightResult.probe2Bytes !== undefined)
-          ) {
-            resolverPreflightSuccessCache.set(cacheKey, {
-              expiresAt:
-                Date.now() + RESOLVER_PREFLIGHT_SUCCESS_CACHE_TTL_MS,
-              mediaBytes: preflightResult.mediaBytes,
-              mediaSignature: preflightResult.mediaSignature,
-              reportedFileSize: preflightResult.reportedFileSize,
-              probe2Start: preflightResult.probe2Start,
-              probe2Bytes: preflightResult.probe2Bytes,
-            });
-          }
         }
+
+        const preflightResult = await inspectUrl(
+          url,
+          0,
+          expectedFileSize,
+          cacheIdentity,
+          false
+        );
         resultById.set(stream.id, preflightResult);
 
         let host = 'unknown';

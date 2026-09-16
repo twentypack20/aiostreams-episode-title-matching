@@ -39,9 +39,9 @@ export const isSupportedExternalResolverUrl = (value: string): boolean => {
 };
 
 /**
- * Returns true for resolver-to-resolver hops that may safely be followed by
- * the server. Final media/CDN hosts are intentionally not included: callers
- * should hand those URLs back to the playback client without fetching them.
+ * Returns true for known resolver-to-resolver hops. Final media/CDN hosts are
+ * intentionally not part of this allowlist; external-resolver callers may
+ * still validate a resolver-produced final target with bounded Range probes.
  */
 export const isKnownExternalResolverHopUrl = (value: string): boolean => {
   const parsed = parseHttpUrl(value);
