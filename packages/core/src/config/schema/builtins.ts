@@ -88,6 +88,7 @@ const boolOrDebridStore = z.union([z.boolean(), debridStore]);
 
 const Day = 86400;
 const Week = 7 * Day;
+const Month = 30 * Day;
 
 /**
  * Built-in addons.
@@ -141,6 +142,16 @@ export const builtinsSchema = {
       description:
         'How long content-level failures (e.g. download status = failed/invalid) are cached globally to suppress retries.',
       env: 'BUILTIN_DEBRID_ERROR_CACHE_TTL',
+      requiresRestart: false,
+      secret: false,
+    },
+    legalUnavailableCacheTtl: {
+      schema: seconds,
+      default: Month,
+      label: 'Legal-unavailable cache TTL (s)',
+      description:
+        'How long provider-confirmed legal/unavailable torrent hashes are remembered and suppressed for that debrid provider.',
+      env: 'BUILTIN_DEBRID_LEGAL_UNAVAILABLE_CACHE_TTL',
       requiresRestart: false,
       secret: false,
     },

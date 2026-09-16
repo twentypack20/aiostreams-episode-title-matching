@@ -25,6 +25,7 @@ import { formatBitrate, formatBytes } from '../formatters/utils.js';
 import { iso6391ToLanguage } from '../utils/languages.js';
 import { ReleaseDate } from '../metadata/tmdb.js';
 import { StreamContext, ExtendedMetadata } from './context.js';
+import { DebridFailureCache } from '../debrid/base.js';
 
 const logger = createLogger('filterer');
 
@@ -3565,11 +3566,66 @@ class StreamFilterer {
       return Math.min(max, Math.max(min, Math.floor(parsed)));
     };
 
+    const hideLegalEnv =
+      process.env.PLAYBACK_HIDE_LEGAL_UNAVAILABLE ??
+      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE;
+    const hideLegalUnavailable =
+      hideLegalEnv === undefined ? true : boolEnv(hideLegalEnv);
+
+    let workingStreams = streams;
+    if (hideLegalUnavailable && workingStreams.length > 0) {
+      const legallyUnavailableIds = new Set<string>();
+
+      await Promise.all(
+        workingStreams.map(async (stream) => {
+          const serviceId = stream.service?.id;
+          const hash = stream.torrent?.infoHash;
+          if (!serviceId || !hash) return;
+
+          const cachedFailure = await DebridFailureCache.peek(
+            serviceId,
+            'torrent',
+            hash
+          );
+          if (
+            cachedFailure?.code !== 'UNAVAILABLE_FOR_LEGAL_REASONS' &&
+            cachedFailure?.statusCode !== 451
+          ) {
+            return;
+          }
+
+          legallyUnavailableIds.add(stream.id);
+          const serviceName =
+            constants.SERVICE_DETAILS[serviceId]?.shortName ?? serviceId;
+          this.incrementRemovalReason(
+            'excludedFilterCondition',
+            `Legal Unavailable (${serviceName})`
+          );
+          logger.debug('Suppressed provider-confirmed legal-unavailable stream', {
+            id,
+            streamId: stream.id,
+            provider: serviceId,
+            hashPrefix: hash.slice(0, 10),
+          });
+        })
+      );
+
+      if (legallyUnavailableIds.size > 0) {
+        workingStreams = workingStreams.filter(
+          (stream) => !legallyUnavailableIds.has(stream.id)
+        );
+        logger.info('Suppressed remembered legal-unavailable streams', {
+          id,
+          removed: legallyUnavailableIds.size,
+        });
+      }
+    }
+
     const enabled = boolEnv(
       process.env.PLAYBACK_PREFLIGHT_CHECK ??
         process.env.ANIME_PREFLIGHT_PLAYBACK_CHECK
     );
-    if (!enabled || streams.length === 0) return streams;
+    if (!enabled || workingStreams.length === 0) return workingStreams;
 
     // A limit of 0 means check every final playable stream. A positive value is
     // retained as an emergency cap for users with unusually large result lists.
@@ -3594,11 +3650,6 @@ class StreamFilterer {
       1,
       10
     );
-    const hideLegalEnv =
-      process.env.PLAYBACK_HIDE_LEGAL_UNAVAILABLE ??
-      process.env.ANIME_HIDE_LEGAL_UNAVAILABLE;
-    const hideLegalUnavailable =
-      hideLegalEnv === undefined ? true : boolEnv(hideLegalEnv);
     const inconclusiveMode = (
       process.env.PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE ??
       process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE ??
@@ -3849,6 +3900,7 @@ class StreamFilterer {
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      let probingResolverMediaBody = false;
 
       try {
         const resolverRoute = isResolverUrl(url);
@@ -3954,6 +4006,25 @@ class StreamFilterer {
         }
 
         if (isMediaContentType(contentType)) {
+          // Torrentio and similar resolver hosts can return media headers
+          // immediately even when the body will never produce a playable byte.
+          // For known resolver-hop hosts, require one body byte before calling
+          // the route playable. This remains intentionally limited to resolver
+          // hosts; direct debrid/CDN URLs are never consumed by the VPS.
+          if (resolverRoute && isKnownExternalResolverHopUrl(url)) {
+            probingResolverMediaBody = true;
+            const bytes = await readBodySnippet(response, 1);
+            probingResolverMediaBody = false;
+            if (bytes.length === 0) {
+              return {
+                status: 'failed',
+                reason:
+                  'Preflight failed: resolver returned media headers but no media bytes',
+              };
+            }
+            return { status: 'passed' };
+          }
+
           try {
             await response.body?.cancel();
           } catch {}
@@ -4049,6 +4120,12 @@ class StreamFilterer {
         const timedOut =
           error instanceof Error &&
           (error.name === 'AbortError' || /aborted|timeout/i.test(message));
+        if (timedOut && probingResolverMediaBody) {
+          return {
+            status: 'failed',
+            reason: `Preflight failed: resolver media body produced no bytes within ${timeoutMs} ms`,
+          };
+        }
         return {
           status: 'inconclusive',
           reason: timedOut
@@ -4060,7 +4137,7 @@ class StreamFilterer {
       }
     };
 
-    const allCandidates = streams.filter(
+    const allCandidates = workingStreams.filter(
       (stream) =>
         stream.type !== 'info' && getPreflightUrl(stream) !== undefined
     );
@@ -4069,7 +4146,7 @@ class StreamFilterer {
         ? allCandidates.slice(0, configuredLimit)
         : allCandidates;
 
-    if (candidates.length === 0) return streams;
+    if (candidates.length === 0) return workingStreams;
 
     const resultById = new Map<string, PreflightResult>();
     let nextIndex = 0;
@@ -4134,7 +4211,7 @@ class StreamFilterer {
       inconclusiveMode,
     });
 
-    let result = streams.filter((stream) => !failedIds.has(stream.id));
+    let result = workingStreams.filter((stream) => !failedIds.has(stream.id));
 
     if (inconclusiveMode === 'remove') {
       for (const stream of result) {

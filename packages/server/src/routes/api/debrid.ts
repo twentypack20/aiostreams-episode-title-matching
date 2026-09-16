@@ -5,6 +5,7 @@ import {
   createLogger,
   formatZodError,
   DebridError,
+  DebridFailureCache,
   PlaybackInfoSchema,
   getDebridService,
   ServiceAuthSchema,
@@ -199,7 +200,28 @@ const findErrorCode = (error: unknown): string | undefined => {
   return undefined;
 };
 
+const getErrorStatusCode = (error: unknown): number | undefined => {
+  if (!error || typeof error !== 'object') return undefined;
+  const statusCode = (error as { statusCode?: unknown }).statusCode;
+  return typeof statusCode === 'number' ? statusCode : undefined;
+};
+
+const isCacheAndPlayDownloadTimeout = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return (
+    getErrorStatusCode(error) === 408 &&
+    /timed out waiting for magnet to download/i.test(message)
+  );
+};
+
 const classifyResolveError = (error: unknown): ResolveRetryDecision => {
+  if (isCacheAndPlayDownloadTimeout(error)) {
+    return {
+      retry: false,
+      reason: 'cache-and-play download wait timed out',
+    };
+  }
+
   if (error instanceof DebridError) {
     if (error.code === 'TOO_MANY_REQUESTS') {
       return {
@@ -452,6 +474,40 @@ const probePlaybackCdnUrl = async (
   }
 };
 
+const readFetchBodyPrefix = async (
+  response: Awaited<ReturnType<typeof fetch>>,
+  maxBytes: number = 1
+): Promise<Uint8Array> => {
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.length) continue;
+      const remaining = maxBytes - total;
+      const chunk = value.length > remaining ? value.slice(0, remaining) : value;
+      chunks.push(chunk);
+      total += chunk.length;
+      if (value.length > remaining) break;
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {}
+  }
+
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return combined;
+};
+
 const readFetchBodySnippet = async (
   response: Awaited<ReturnType<typeof fetch>>,
   maxBytes: number = 64 * 1024
@@ -653,6 +709,35 @@ const resolveExternalResolverChain = async (
         contentType
       )
     ) {
+      if (isKnownExternalResolverHopUrl(currentUrl)) {
+        try {
+          const bytes = await readFetchBodyPrefix(response, 1);
+          if (bytes.length === 0) {
+            throw new ExternalResolverError(
+              'External resolver returned media headers but no media bytes',
+              false,
+              502
+            );
+          }
+        } catch (error) {
+          if (error instanceof ExternalResolverError) throw error;
+          const message =
+            error instanceof Error ? error.message : String(error ?? 'unknown error');
+          if (
+            error instanceof Error &&
+            (error.name === 'AbortError' || /aborted|timeout/i.test(message))
+          ) {
+            throw new ExternalResolverError(
+              'External resolver media body produced no bytes before timeout',
+              false,
+              504
+            );
+          }
+          throw error;
+        }
+        return currentUrl;
+      }
+
       await cancelFetchBody(response);
       return currentUrl;
     }
@@ -928,6 +1013,8 @@ router.get(
       else if (statusCode === 429) staticFile = StaticFiles.TOO_MANY_REQUESTS;
       else if (statusCode === 451) {
         staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
+      } else if (statusCode === 502 || statusCode === 504) {
+        staticFile = StaticFiles.DOWNLOAD_FAILED;
       }
 
       res.redirect(307, `/static/${staticFile}`);
@@ -1294,7 +1381,11 @@ router.get(
       }
 
       if (resolveError) {
-        let staticFile: string = StaticFiles.INTERNAL_SERVER_ERROR;
+        const cacheAndPlayDownloadTimeout =
+          isCacheAndPlayDownloadTimeout(resolveError);
+        let staticFile: string = cacheAndPlayDownloadTimeout
+          ? StaticFiles.DOWNLOADING
+          : StaticFiles.INTERNAL_SERVER_ERROR;
         if (resolveError instanceof DebridError) {
           logger.error(
             {
@@ -1303,6 +1394,27 @@ router.get(
             },
             `error during debrid resolve: ${resolveError.message}`
           );
+
+          if (
+            fileInfo.type === 'torrent' &&
+            fileInfo.hash &&
+            (resolveError.code === 'UNAVAILABLE_FOR_LEGAL_REASONS' ||
+              resolveError.statusCode === 451)
+          ) {
+            await DebridFailureCache.mark(
+              storeAuth.id,
+              'torrent',
+              fileInfo.hash,
+              resolveError
+            ).catch((error) => {
+              logger.warn('Failed to cache legal-unavailable torrent result', {
+                provider: storeAuth.id,
+                hashPrefix: fileInfo.hash.slice(0, 10),
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+
           switch (resolveError.code) {
             case 'UNAVAILABLE_FOR_LEGAL_REASONS':
               staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;

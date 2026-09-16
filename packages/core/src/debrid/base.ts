@@ -97,6 +97,21 @@ export class DebridFailureCache {
   }
 
   /**
+   * Read a known content-level failure without throwing. This is used by the
+   * stream-listing path to suppress provider+hash combinations that the
+   * provider has already confirmed cannot be played.
+   */
+  static async peek(
+    serviceId: ServiceId,
+    type: 'torrent' | 'usenet',
+    key: string
+  ): Promise<
+    { message: string; code?: DebridErrorCode; statusCode?: number } | undefined
+  > {
+    return DebridFailureCache.getCache().get(`${serviceId}:${type}:${key}`);
+  }
+
+  /**
    * Check whether a known failure is cached for this item and throw if so.
    */
   static async check(
@@ -104,9 +119,7 @@ export class DebridFailureCache {
     type: 'torrent' | 'usenet',
     key: string
   ): Promise<void> {
-    const cached = await DebridFailureCache.getCache().get(
-      `${serviceId}:${type}:${key}`
-    );
+    const cached = await DebridFailureCache.peek(serviceId, type, key);
     if (cached) {
       throw new DebridError(cached.message, {
         statusCode: cached.statusCode ?? 400,
@@ -129,6 +142,10 @@ export class DebridFailureCache {
     error: DebridError
   ): Promise<void> {
     if (DEBRID_NON_RETRYABLE_CODES.has(error.code)) return;
+    const ttl =
+      error.code === 'UNAVAILABLE_FOR_LEGAL_REASONS' || error.statusCode === 451
+        ? appConfig.builtins.debrid.legalUnavailableCacheTtl
+        : appConfig.builtins.debrid.errorCacheTtl;
     await DebridFailureCache.getCache().set(
       `${serviceId}:${type}:${key}`,
       {
@@ -136,7 +153,7 @@ export class DebridFailureCache {
         code: error.code,
         statusCode: error.statusCode,
       },
-      appConfig.builtins.debrid.errorCacheTtl
+      ttl
     );
   }
 }

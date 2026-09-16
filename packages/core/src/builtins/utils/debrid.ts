@@ -508,9 +508,14 @@ async function processTorrentsForDebridService(
         providerItemId: magnetCheckResult?.id,
         service: {
           id: service.id,
+          // A torrent merely existing in the user's debrid library does not
+          // mean it is ready to stream. Treat only provider-confirmed cached or
+          // fully downloaded items as playable/cached; downloading library
+          // entries must remain uncached so Cache and Play can keep handling
+          // them correctly.
           cached:
             magnetCheckResult?.status === 'cached' ||
-            (magnetCheckResult?.library || torrent.library) === true,
+            magnetCheckResult?.status === 'downloaded',
           library: (magnetCheckResult?.library || torrent.library) === true,
         },
       });
