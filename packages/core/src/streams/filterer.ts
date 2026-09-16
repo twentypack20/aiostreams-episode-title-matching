@@ -552,16 +552,24 @@ class StreamFilterer {
       const languages = stream.parsedFile?.languages?.length
         ? stream.parsedFile.languages
         : ['Unknown'];
-      if (languages.includes('English' as any)) return false;
 
+      // v7.2.12: English parsed from release text is not automatically trusted
+      // here. A release can say both "Dual Audio" and "Eng Subs", causing
+      // the parser to surface English even when the selected media file has only
+      // Japanese audio. Include ambiguous English-bearing candidates in the
+      // TorBox selected-file lookup so provider/container tracks can correct the
+      // release-name guess before Required Language filtering.
+      //
       // Do not spend provider calls on releases that already explicitly claim a
       // different non-English language (Chinese/French/etc.). Target only vague
-      // audio labels plus Japanese, which can become the verified fallback tier.
+      // audio labels plus English/Japanese, which can be authoritatively resolved
+      // into the normal English tier or the verified Japanese fallback tier.
       const lookupEligibleLanguages = new Set([
         'Unknown',
         'Dual Audio',
         'Multi',
         'Dubbed',
+        'English',
         'Japanese',
         'Original',
       ]);
@@ -2240,6 +2248,48 @@ class StreamFilterer {
         return languageSet.has('english');
       }
 
+      const haystack = normaliseLooseText(
+        [
+          stream.filename,
+          stream.folderName,
+          stream.originalName,
+          file?.title,
+          file?.releaseGroup,
+        ]
+          .filter(Boolean)
+          .join(' ')
+      );
+      const hasExplicitEnglishAudioText =
+        /\b(english audio|eng audio|en audio|audio english|audio eng|audio en|english dub|eng dub|en dub|dub english|dub eng|dub en|dubbed english|dubbed eng)\b/.test(
+          haystack
+        );
+      const hasSubtitleText =
+        /\b(english subs?|eng subs?|en subs?|english subtitles?|eng subtitles?|subbed|multi subs?|multisubs?)\b/.test(
+          haystack
+        );
+      const hasVagueAudioTag = ['dual audio', 'multi', 'dubbed', 'unknown'].some(
+        (language) => languageSet.has(language)
+      );
+
+      // v7.2.12: TorBox gives us a way to inspect the exact selected file. For
+      // foreign-original anime, do not let ambiguous release-name metadata such
+      // as "Dual Audio + Eng Subs" manufacture an English audio track. The
+      // resolver enrichment above now includes English-bearing ambiguous
+      // candidates and will replace this metadata when TorBox exposes actual
+      // container tracks. If it cannot, keep only an explicit English-audio/dub
+      // statement as a strong fallback signal.
+      if (
+        isAnime &&
+        originalLanguageLower &&
+        originalLanguageLower !== 'english' &&
+        stream.service?.id?.toLowerCase() === 'torbox' &&
+        stream.torrent?.infoHash &&
+        stream.torrent.fileIdx !== undefined &&
+        (hasVagueAudioTag || hasSubtitleText)
+      ) {
+        return hasExplicitEnglishAudioText;
+      }
+
       if (languageSet.has('dual audio') || languageSet.has('dubbed')) {
         return true;
       }
@@ -2257,20 +2307,11 @@ class StreamFilterer {
         return true;
       }
 
-      const haystack = normaliseLooseText(
-        [
-          stream.filename,
-          stream.folderName,
-          stream.originalName,
-          file?.title,
-          file?.releaseGroup,
-        ]
-          .filter(Boolean)
-          .join(' ')
-      );
-
-      return /\b(dual audio|dual audio eng|multi audio|multi audio eng|dubbed|english dub|eng dub|dub eng|en dub|dub)\b/.test(
-        haystack
+      return (
+        hasExplicitEnglishAudioText ||
+        /\b(dual audio|dual audio eng|multi audio|multi audio eng|dubbed|dub)\b/.test(
+          haystack
+        )
       );
     };
 
