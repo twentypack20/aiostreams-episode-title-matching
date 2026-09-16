@@ -29,6 +29,7 @@ import {
   getExternalResolverProvider,
 } from '../utils/index.js';
 import { generateBingeGroup } from './utils.js';
+import { getTrustedSelectedFileSize } from '../streams/utils.js';
 
 type ErrorOptions = {
   errorTitle?: string;
@@ -93,6 +94,7 @@ export class StremioTransformer {
           version: 1,
           url: playbackUrl,
           expiresAt,
+          expectedFileSize: getTrustedSelectedFileSize(stream),
         })
       );
 

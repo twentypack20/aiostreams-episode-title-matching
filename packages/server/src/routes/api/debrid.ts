@@ -323,12 +323,14 @@ const ExternalResolverPayloadSchema = z.object({
   version: z.literal(1),
   url: z.string().url(),
   expiresAt: z.number().int().positive(),
+  expectedFileSize: z.number().int().positive().optional(),
 });
 
 type ExternalResolverPayload = {
   version: 1;
   url: string;
   expiresAt: number;
+  expectedFileSize?: number;
 };
 
 class ExternalResolverError extends Error {
@@ -360,11 +362,18 @@ const externalResolverConfig = {
     process.env.EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL,
     true
   ),
-  minMediaBytes: parseIntegerEnv(
-    process.env.EXTERNAL_RESOLVER_MIN_MEDIA_BYTES,
-    32 * 1024,
-    1024,
+  probeBytes: parseIntegerEnv(
+    process.env.EXTERNAL_RESOLVER_PROBE_BYTES ??
+      process.env.EXTERNAL_RESOLVER_MIN_MEDIA_BYTES,
+    64 * 1024,
+    4 * 1024,
     256 * 1024
+  ),
+  sizeTolerancePercent: parseIntegerEnv(
+    process.env.EXTERNAL_RESOLVER_SIZE_TOLERANCE_PERCENT,
+    25,
+    0,
+    100
   ),
 };
 
@@ -614,6 +623,63 @@ const externalResolverPrefixLooksTextual = (bytes: Uint8Array): boolean => {
   return printable / sample.length >= 0.85;
 };
 
+type ParsedContentRange = {
+  start: number;
+  end: number;
+  total?: number;
+};
+
+const parseContentRangeHeader = (
+  value: string | null
+): ParsedContentRange | undefined => {
+  if (!value) return undefined;
+  const match = value.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+  if (!match) return undefined;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  const total = match[3] === '*' ? undefined : Number(match[3]);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+    return undefined;
+  }
+  return {
+    start,
+    end,
+    total: Number.isFinite(total) && total! > 0 ? total : undefined,
+  };
+};
+
+const parsePositiveHeaderNumber = (value: string | null): number | undefined => {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+};
+
+const externalResolverSizesAreClose = (
+  expected: number,
+  reported: number
+): boolean => {
+  if (expected <= 0 || reported <= 0) return true;
+  return (
+    Math.abs(reported - expected) / expected <=
+    externalResolverConfig.sizeTolerancePercent / 100
+  );
+};
+
+const getExternalResolverSecondProbeStart = (
+  reportedFileSize?: number,
+  expectedFileSize?: number
+): number => {
+  const basis = reportedFileSize ?? expectedFileSize;
+  if (!basis || !Number.isFinite(basis) || basis <= 0) {
+    return 1024 * 1024;
+  }
+
+  const quarter = Math.floor(basis * 0.25);
+  const minimum = externalResolverConfig.probeBytes * 2;
+  const maximum = Math.max(0, basis - externalResolverConfig.probeBytes - 1);
+  return Math.min(Math.max(quarter, minimum), maximum);
+};
+
 const readFetchBodySnippet = async (
   response: Awaited<ReturnType<typeof fetch>>,
   maxBytes: number = 64 * 1024
@@ -725,7 +791,8 @@ const parseHttpTarget = (value: string, base: string): string => {
 const resolveExternalResolverChain = async (
   sourceUrl: string,
   signal: AbortSignal,
-  clientIp?: string
+  clientIp?: string,
+  expectedFileSize?: number
 ): Promise<string> => {
   let currentUrl = sourceUrl;
 
@@ -739,7 +806,7 @@ const resolveExternalResolverChain = async (
           'video/*, audio/*, application/octet-stream, application/json, text/plain, */*;q=0.5',
         'User-Agent': 'AIOStreams external resolver playback',
         ...(isKnownExternalResolverHopUrl(currentUrl)
-          ? { Range: `bytes=0-${externalResolverConfig.minMediaBytes - 1}` }
+          ? { Range: `bytes=0-${externalResolverConfig.probeBytes - 1}` }
           : {}),
         ...(clientIp
           ? {
@@ -820,9 +887,18 @@ const resolveExternalResolverChain = async (
     ) {
       if (isKnownExternalResolverHopUrl(currentUrl)) {
         try {
+          const firstRange = parseContentRangeHeader(
+            response.headers.get('content-range')
+          );
+          const firstContentLength = parsePositiveHeaderNumber(
+            response.headers.get('content-length')
+          );
+          const reportedFileSize =
+            firstRange?.total ?? (status === 200 ? firstContentLength : undefined);
+
           const bytes = await readFetchBodyPrefix(
             response,
-            externalResolverConfig.minMediaBytes
+            externalResolverConfig.probeBytes
           );
           const mediaSignature = detectExternalResolverMediaSignature(
             bytes,
@@ -847,10 +923,10 @@ const resolveExternalResolverChain = async (
 
           if (
             !manifestResponse &&
-            bytes.length < externalResolverConfig.minMediaBytes
+            bytes.length < externalResolverConfig.probeBytes
           ) {
             throw new ExternalResolverError(
-              `External resolver produced only ${bytes.length} of ${externalResolverConfig.minMediaBytes} required media bytes`,
+              `External resolver produced only ${bytes.length} of ${externalResolverConfig.probeBytes} required media bytes`,
               false,
               504
             );
@@ -864,7 +940,133 @@ const resolveExternalResolverChain = async (
             );
           }
 
-          logger.debug('External resolver media prefix validated', {
+          if (
+            !manifestResponse &&
+            expectedFileSize !== undefined &&
+            reportedFileSize !== undefined &&
+            !externalResolverSizesAreClose(expectedFileSize, reportedFileSize)
+          ) {
+            throw new ExternalResolverError(
+              `External resolver media size ${reportedFileSize} does not match expected file size ${expectedFileSize}`,
+              false,
+              502
+            );
+          }
+
+          let probe2Start: number | undefined;
+          let probe2BytesLength: number | undefined;
+
+          if (!manifestResponse) {
+            probe2Start = getExternalResolverSecondProbeStart(
+              reportedFileSize,
+              expectedFileSize
+            );
+            if (probe2Start <= 0) {
+              throw new ExternalResolverError(
+                'External resolver media object is too small for a second Range probe',
+                false,
+                502
+              );
+            }
+
+            const probe2End =
+              probe2Start + externalResolverConfig.probeBytes - 1;
+            const probe2Response = await fetch(currentUrl, {
+              method: 'GET',
+              redirect: 'manual',
+              signal,
+              headers: {
+                Accept:
+                  'video/*, audio/*, application/octet-stream, */*;q=0.5',
+                'User-Agent': 'AIOStreams external resolver playback',
+                Range: `bytes=${probe2Start}-${probe2End}`,
+                ...(clientIp
+                  ? {
+                      'X-Forwarded-For': clientIp,
+                      'X-Real-IP': clientIp,
+                    }
+                  : {}),
+              },
+            });
+
+            const probe2Range = parseContentRangeHeader(
+              probe2Response.headers.get('content-range')
+            );
+            const probe2ContentType =
+              probe2Response.headers
+                .get('content-type')
+                ?.split(';')[0]
+                .trim()
+                .toLowerCase() ?? '';
+
+            if (
+              probe2Response.status !== 206 ||
+              !probe2Range ||
+              probe2Range.start !== probe2Start
+            ) {
+              await cancelFetchBody(probe2Response);
+              throw new ExternalResolverError(
+                `External resolver did not honor second Range probe at byte ${probe2Start}`,
+                false,
+                502
+              );
+            }
+
+            if (
+              !/^(video|audio)\//.test(probe2ContentType) &&
+              !/application\/(?:octet-stream|x-matroska|mp4)/.test(
+                probe2ContentType
+              )
+            ) {
+              await cancelFetchBody(probe2Response);
+              throw new ExternalResolverError(
+                `External resolver second Range probe returned ${probe2ContentType || 'unknown content type'}`,
+                false,
+                502
+              );
+            }
+
+            const probe2Bytes = await readFetchBodyPrefix(
+              probe2Response,
+              externalResolverConfig.probeBytes
+            );
+            probe2BytesLength = probe2Bytes.length;
+
+            if (probe2Bytes.length < externalResolverConfig.probeBytes) {
+              throw new ExternalResolverError(
+                `External resolver second Range probe produced only ${probe2Bytes.length} of ${externalResolverConfig.probeBytes} required bytes`,
+                false,
+                504
+              );
+            }
+
+            if (externalResolverPrefixLooksTextual(probe2Bytes)) {
+              const text = new TextDecoder('utf-8', { fatal: false })
+                .decode(probe2Bytes)
+                .trim();
+              if (resolverErrorBodyPattern.test(text)) {
+                throw new ExternalResolverError(
+                  'External resolver second Range probe returned an error body',
+                  false,
+                  502
+                );
+              }
+            }
+
+            if (
+              reportedFileSize !== undefined &&
+              probe2Range.total !== undefined &&
+              reportedFileSize !== probe2Range.total
+            ) {
+              throw new ExternalResolverError(
+                'External resolver reported inconsistent media size across Range probes',
+                false,
+                502
+              );
+            }
+          }
+
+          logger.debug('External resolver media validation passed', {
             host: (() => {
               try {
                 return new URL(currentUrl).host;
@@ -872,8 +1074,12 @@ const resolveExternalResolverChain = async (
                 return 'unknown';
               }
             })(),
-            bytes: bytes.length,
+            expectedFileSize,
+            reportedFileSize,
+            probe1Bytes: bytes.length,
             signature: mediaSignature,
+            probe2Start,
+            probe2Bytes: probe2BytesLength,
           });
         } catch (error) {
           if (error instanceof ExternalResolverError) throw error;
@@ -884,7 +1090,7 @@ const resolveExternalResolverChain = async (
             (error.name === 'AbortError' || /aborted|timeout/i.test(message))
           ) {
             throw new ExternalResolverError(
-              `External resolver failed to produce ${externalResolverConfig.minMediaBytes} media bytes before timeout`,
+              `External resolver media validation timed out after requiring two ${externalResolverConfig.probeBytes}-byte probes`,
               false,
               504
             );
@@ -1078,7 +1284,8 @@ router.get(
           const finalUrl = await resolveExternalResolverChain(
             payload.url,
             controller.signal,
-            req.userIp
+            req.userIp,
+            payload.expectedFileSize
           );
           clearTimeout(timeout);
 

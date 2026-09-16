@@ -1,6 +1,6 @@
 {
-  "version": "7.2.7",
+  "version": "7.2.8",
   "description": "AIOStreams consolidates multiple Stremio addons and debrid services into one highly configurable addon, with enhanced anime matching, verified media metadata, and reliable debrid playback.",
-  "tag": "v7.2.7-custom",
+  "tag": "v7.2.8-custom",
   "channel": "stable"
 }

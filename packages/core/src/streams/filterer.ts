@@ -14,7 +14,10 @@ import {
   StreamSelector,
   extractNamesFromExpression,
 } from '../parser/streamExpression.js';
-import StreamUtils, { shouldPassthroughStage } from './utils.js';
+import StreamUtils, {
+  getTrustedSelectedFileSize,
+  shouldPassthroughStage,
+} from './utils.js';
 import {
   normaliseTitle,
   preprocessTitle,
@@ -28,6 +31,24 @@ import { StreamContext, ExtendedMetadata } from './context.js';
 import { DebridFailureCache } from '../debrid/base.js';
 
 const logger = createLogger('filterer');
+
+type ResolverPreflightCacheEntry = {
+  expiresAt: number;
+  mediaBytes?: number;
+  mediaSignature?: string;
+  reportedFileSize?: number;
+  probe2Start?: number;
+  probe2Bytes?: number;
+};
+
+// Successful external resolver validation can be moderately expensive because
+// v7.2.8 uses two small Range probes. Cache only successful validations; failed
+// or inconclusive checks should be re-evaluated on the next request.
+const resolverPreflightSuccessCache = new Map<
+  string,
+  ResolverPreflightCacheEntry
+>();
+const RESOLVER_PREFLIGHT_SUCCESS_CACHE_TTL_MS = 10 * 60 * 1000;
 
 interface Reason {
   total: number;
@@ -374,10 +395,10 @@ class StreamFilterer {
       process.env.TORRENTIO_ANIME_RESOLVE_MODE || 'allow'
     ).toLowerCase();
 
-    // Custom safeguard for uncached debrid results. Downloading a very large
-    // uncached torrent can be wasteful (especially season packs), while an
-    // already-cached result is instant and should not be penalised by this
-    // separate limit. Set UNCACHED_MAX_SIZE_GB=0 to disable it.
+    // Custom safeguard for uncached debrid results. The limit is applied only
+    // when we can trust `stream.size` as the selected file/episode size; an
+    // unknown whole-season-pack size must not hide a small episode inside it.
+    // Cached/ready results remain exempt. Set UNCACHED_MAX_SIZE_GB=0 to disable.
     const uncachedMaxSizeGbRaw = Number(
       process.env.UNCACHED_MAX_SIZE_GB ?? '8'
     );
@@ -3384,16 +3405,17 @@ class StreamFilterer {
         }
       }
 
+      const trustedSelectedFileSize = getTrustedSelectedFileSize(stream);
       if (
         uncachedMaxSizeBytes !== undefined &&
         stream.type === 'debrid' &&
         stream.service?.cached === false &&
-        stream.size !== undefined &&
-        stream.size > uncachedMaxSizeBytes
+        trustedSelectedFileSize !== undefined &&
+        trustedSelectedFileSize > uncachedMaxSizeBytes
       ) {
         this.incrementRemovalReason(
           'size',
-          `Uncached > ${formatBytes(uncachedMaxSizeBytes, 1000)}`
+          `Uncached selected file > ${formatBytes(uncachedMaxSizeBytes, 1000)}`
         );
         return false;
       }
@@ -3676,11 +3698,18 @@ class StreamFilterer {
       1,
       10
     );
-    const resolverMinMediaBytes = numberEnv(
-      process.env.EXTERNAL_RESOLVER_MIN_MEDIA_BYTES,
-      32 * 1024,
-      1024,
+    const resolverProbeBytes = numberEnv(
+      process.env.EXTERNAL_RESOLVER_PROBE_BYTES ??
+        process.env.EXTERNAL_RESOLVER_MIN_MEDIA_BYTES,
+      64 * 1024,
+      4 * 1024,
       256 * 1024
+    );
+    const resolverSizeTolerancePercent = numberEnv(
+      process.env.EXTERNAL_RESOLVER_SIZE_TOLERANCE_PERCENT,
+      25,
+      0,
+      100
     );
     const inconclusiveMode = (
       process.env.PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE ??
@@ -3694,6 +3723,11 @@ class StreamFilterer {
       reason?: string;
       mediaBytes?: number;
       mediaSignature?: string;
+      expectedFileSize?: number;
+      reportedFileSize?: number;
+      probe2Start?: number;
+      probe2Bytes?: number;
+      cacheHit?: boolean;
     };
 
     const getPreflightUrl = (stream: ParsedStream): string | undefined => {
@@ -3926,6 +3960,61 @@ class StreamFilterer {
       return printable / sample.length >= 0.85;
     };
 
+    type ParsedContentRange = {
+      start: number;
+      end: number;
+      total?: number;
+    };
+
+    const parseContentRange = (
+      value: string | null
+    ): ParsedContentRange | undefined => {
+      if (!value) return undefined;
+      const match = value.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+      if (!match) return undefined;
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const total = match[3] === '*' ? undefined : Number(match[3]);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+        return undefined;
+      }
+      return {
+        start,
+        end,
+        total: Number.isFinite(total) && total! > 0 ? total : undefined,
+      };
+    };
+
+    const parseContentLength = (value: string | null): number | undefined => {
+      if (!value) return undefined;
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+    };
+
+    const sizesAreReasonablyClose = (
+      expected: number,
+      reported: number
+    ): boolean => {
+      if (expected <= 0 || reported <= 0) return true;
+      const differenceRatio = Math.abs(reported - expected) / expected;
+      return differenceRatio <= resolverSizeTolerancePercent / 100;
+    };
+
+    const getSecondProbeStart = (
+      reportedFileSize?: number,
+      expectedFileSize?: number
+    ): number => {
+      const basis = reportedFileSize ?? expectedFileSize;
+      if (!basis || !Number.isFinite(basis) || basis <= 0) {
+        return 1024 * 1024;
+      }
+
+      const quarter = Math.floor(basis * 0.25);
+      const minimum = resolverProbeBytes * 2;
+      const maximum = Math.max(0, basis - resolverProbeBytes - 1);
+      return Math.min(Math.max(quarter, minimum), maximum);
+    };
+
     const isResolverUrl = (url: string): boolean =>
       /\/api\/v1\/debrid\/(?:playback|external-resolver)\//i.test(url) ||
       isKnownExternalResolverHopUrl(url);
@@ -4003,7 +4092,8 @@ class StreamFilterer {
 
     const inspectUrl = async (
       url: string,
-      redirectDepth: number = 0
+      redirectDepth: number = 0,
+      expectedFileSize?: number
     ): Promise<PreflightResult> => {
       // Do not execute our own native playback route during server-side
       // preflight. Resolving it here uses the VPS request context and can warm a
@@ -4040,7 +4130,7 @@ class StreamFilterer {
               'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, application/json, text/plain, */*;q=0.5',
             'User-Agent': 'AIOStreams resolver preflight',
             ...(resolverRoute && isKnownExternalResolverHopUrl(url)
-              ? { Range: `bytes=0-${resolverMinMediaBytes - 1}` }
+              ? { Range: `bytes=0-${resolverProbeBytes - 1}` }
               : {}),
             ...(resolverRoute && this.userData.ip
               ? {
@@ -4082,7 +4172,11 @@ class StreamFilterer {
             };
           }
           if ('nestedResolverUrl' in classified) {
-            return inspectUrl(classified.nestedResolverUrl, redirectDepth + 1);
+            return inspectUrl(
+              classified.nestedResolverUrl,
+              redirectDepth + 1,
+              expectedFileSize
+            );
           }
           return classified;
         }
@@ -4141,17 +4235,21 @@ class StreamFilterer {
         }
 
         if (isMediaContentType(contentType)) {
-          // v7.2.7: A one-byte probe was too weak: an unhealthy Torrentio-style
-          // resolver could emit a byte/header and then stall forever in Stremio.
-          // For known resolver-hop hosts, require a meaningful prefix quickly
-          // and validate a common media/container signature. Direct final
-          // debrid/CDN URLs are still never consumed by the VPS.
+          // v7.2.8: validate known external resolver media with two small Range
+          // probes instead of trusting a valid-looking prefix alone. The first
+          // probe validates the container and total size; the second proves the
+          // server can serve bytes from deeper inside the same media object.
           if (resolverRoute && isKnownExternalResolverHopUrl(url)) {
             probingResolverMediaBody = true;
-            const bytes = await readBodySnippet(
-              response,
-              resolverMinMediaBytes
+            const firstRange = parseContentRange(
+              response.headers.get('content-range')
             );
+            const firstContentLength = parseContentLength(
+              response.headers.get('content-length')
+            );
+            const reportedFileSize =
+              firstRange?.total ?? (status === 200 ? firstContentLength : undefined);
+            const bytes = await readBodySnippet(response, resolverProbeBytes);
             probingResolverMediaBody = false;
 
             const mediaSignature = detectMediaSignature(bytes, contentType);
@@ -4166,16 +4264,20 @@ class StreamFilterer {
                   status: 'failed',
                   reason: 'Preflight failed: resolver returned an error body with media headers',
                   mediaBytes: bytes.length,
+                  expectedFileSize,
+                  reportedFileSize,
                 };
               }
             }
 
-            if (!manifestResponse && bytes.length < resolverMinMediaBytes) {
+            if (!manifestResponse && bytes.length < resolverProbeBytes) {
               return {
                 status: 'failed',
-                reason: `Preflight failed: resolver produced only ${bytes.length} of ${resolverMinMediaBytes} required media bytes`,
+                reason: `Preflight failed: resolver produced only ${bytes.length} of ${resolverProbeBytes} required media bytes`,
                 mediaBytes: bytes.length,
                 mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
               };
             }
 
@@ -4184,6 +4286,170 @@ class StreamFilterer {
                 status: 'failed',
                 reason: 'Preflight failed: resolver media prefix did not match a known media/container signature',
                 mediaBytes: bytes.length,
+                expectedFileSize,
+                reportedFileSize,
+              };
+            }
+
+            // HLS/DASH are manifests rather than one seekable media file, so a
+            // second byte-range probe is not meaningful for those responses.
+            if (manifestResponse) {
+              return {
+                status: 'passed',
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+              };
+            }
+
+            if (
+              expectedFileSize !== undefined &&
+              reportedFileSize !== undefined &&
+              !sizesAreReasonablyClose(expectedFileSize, reportedFileSize)
+            ) {
+              return {
+                status: 'failed',
+                reason: `Preflight failed: resolver media size ${formatBytes(reportedFileSize, 1000)} does not match expected file size ${formatBytes(expectedFileSize, 1000)}`,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+              };
+            }
+
+            const probe2Start = getSecondProbeStart(
+              reportedFileSize,
+              expectedFileSize
+            );
+            if (probe2Start <= 0) {
+              return {
+                status: 'failed',
+                reason: 'Preflight failed: resolver media object is too small for a second Range probe',
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+              };
+            }
+
+            const probe2End = probe2Start + resolverProbeBytes - 1;
+            const probe2Response = await fetch(url, {
+              method: 'GET',
+              headers: {
+                Accept:
+                  'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, */*;q=0.5',
+                'User-Agent': 'AIOStreams resolver preflight',
+                Range: `bytes=${probe2Start}-${probe2End}`,
+                ...(this.userData.ip
+                  ? {
+                      'X-Forwarded-For': this.userData.ip,
+                      'X-Real-IP': this.userData.ip,
+                    }
+                  : {}),
+              },
+              redirect: 'manual',
+              signal: controller.signal,
+            });
+
+            const probe2Status = probe2Response.status;
+            const probe2ContentType =
+              probe2Response.headers
+                .get('content-type')
+                ?.toLowerCase()
+                .split(';')[0]
+                .trim() ?? '';
+            const probe2Range = parseContentRange(
+              probe2Response.headers.get('content-range')
+            );
+
+            if (
+              probe2Status !== 206 ||
+              !probe2Range ||
+              probe2Range.start !== probe2Start
+            ) {
+              try {
+                await probe2Response.body?.cancel();
+              } catch {}
+              return {
+                status: 'failed',
+                reason: `Preflight failed: resolver did not honor second Range probe at byte ${probe2Start}`,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+                probe2Start,
+              };
+            }
+
+            if (!isMediaContentType(probe2ContentType)) {
+              const probe2Bytes = await readBodySnippet(
+                probe2Response,
+                resolverProbeBytes
+              );
+              return {
+                status: 'failed',
+                reason: `Preflight failed: second Range probe returned ${probe2ContentType || 'unknown content type'}`,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+                probe2Start,
+                probe2Bytes: probe2Bytes.length,
+              };
+            }
+
+            probingResolverMediaBody = true;
+            const probe2Bytes = await readBodySnippet(
+              probe2Response,
+              resolverProbeBytes
+            );
+            probingResolverMediaBody = false;
+
+            if (probe2Bytes.length < resolverProbeBytes) {
+              return {
+                status: 'failed',
+                reason: `Preflight failed: second Range probe produced only ${probe2Bytes.length} of ${resolverProbeBytes} required bytes`,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+                probe2Start,
+                probe2Bytes: probe2Bytes.length,
+              };
+            }
+
+            if (looksMostlyText(probe2Bytes)) {
+              const bodyLower = decodeSnippet(probe2Bytes).toLowerCase();
+              if (errorBodyPattern.test(bodyLower)) {
+                return {
+                  status: 'failed',
+                  reason: 'Preflight failed: second Range probe returned an error body',
+                  mediaBytes: bytes.length,
+                  mediaSignature,
+                  expectedFileSize,
+                  reportedFileSize,
+                  probe2Start,
+                  probe2Bytes: probe2Bytes.length,
+                };
+              }
+            }
+
+            const secondReportedTotal = probe2Range.total;
+            if (
+              reportedFileSize !== undefined &&
+              secondReportedTotal !== undefined &&
+              reportedFileSize !== secondReportedTotal
+            ) {
+              return {
+                status: 'failed',
+                reason: 'Preflight failed: resolver reported inconsistent media size across Range probes',
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize,
+                probe2Start,
+                probe2Bytes: probe2Bytes.length,
               };
             }
 
@@ -4191,6 +4457,10 @@ class StreamFilterer {
               status: 'passed',
               mediaBytes: bytes.length,
               mediaSignature,
+              expectedFileSize,
+              reportedFileSize: reportedFileSize ?? secondReportedTotal,
+              probe2Start,
+              probe2Bytes: probe2Bytes.length,
             };
           }
 
@@ -4243,7 +4513,11 @@ class StreamFilterer {
                 };
               }
               if ('nestedResolverUrl' in classified) {
-                return inspectUrl(classified.nestedResolverUrl, redirectDepth + 1);
+                return inspectUrl(
+              classified.nestedResolverUrl,
+              redirectDepth + 1,
+              expectedFileSize
+            );
               }
               return classified;
             }
@@ -4259,7 +4533,11 @@ class StreamFilterer {
               };
             }
             if ('nestedResolverUrl' in classified) {
-              return inspectUrl(classified.nestedResolverUrl, redirectDepth + 1);
+              return inspectUrl(
+              classified.nestedResolverUrl,
+              redirectDepth + 1,
+              expectedFileSize
+            );
             }
             return classified;
           }
@@ -4321,6 +4599,19 @@ class StreamFilterer {
     let nextIndex = 0;
     const workerCount = Math.min(concurrency, candidates.length);
 
+    const getPreflightCacheKey = (
+      stream: ParsedStream,
+      url: string
+    ): string => {
+      const service = stream.service?.id ?? 'unknown';
+      const hash = stream.torrent?.infoHash?.toLowerCase();
+      const fileIdx = stream.torrent?.fileIdx;
+      if (hash) {
+        return `${service}:${hash}:${fileIdx ?? '-'}:${stream.filename ?? '-'}`;
+      }
+      return `${service}:${url}`;
+    };
+
     const worker = async (): Promise<void> => {
       while (true) {
         const currentIndex = nextIndex++;
@@ -4328,7 +4619,50 @@ class StreamFilterer {
         const stream = candidates[currentIndex];
         const url = getPreflightUrl(stream);
         if (!url) continue;
-        const preflightResult = await inspectUrl(url);
+
+        const expectedFileSize = getTrustedSelectedFileSize(stream);
+        const cacheKey = getPreflightCacheKey(stream, url);
+        const cachedValidation = resolverPreflightSuccessCache.get(cacheKey);
+        let preflightResult: PreflightResult;
+
+        if (cachedValidation && cachedValidation.expiresAt > Date.now()) {
+          preflightResult = {
+            status: 'passed',
+            mediaBytes: cachedValidation.mediaBytes,
+            mediaSignature: cachedValidation.mediaSignature,
+            expectedFileSize,
+            reportedFileSize: cachedValidation.reportedFileSize,
+            probe2Start: cachedValidation.probe2Start,
+            probe2Bytes: cachedValidation.probe2Bytes,
+            cacheHit: true,
+          };
+        } else {
+          if (cachedValidation) resolverPreflightSuccessCache.delete(cacheKey);
+          if (resolverPreflightSuccessCache.size > 2000) {
+            const now = Date.now();
+            for (const [key, entry] of resolverPreflightSuccessCache) {
+              if (entry.expiresAt <= now) {
+                resolverPreflightSuccessCache.delete(key);
+              }
+            }
+          }
+          preflightResult = await inspectUrl(url, 0, expectedFileSize);
+          if (
+            preflightResult.status === 'passed' &&
+            (preflightResult.mediaSignature ||
+              preflightResult.probe2Bytes !== undefined)
+          ) {
+            resolverPreflightSuccessCache.set(cacheKey, {
+              expiresAt:
+                Date.now() + RESOLVER_PREFLIGHT_SUCCESS_CACHE_TTL_MS,
+              mediaBytes: preflightResult.mediaBytes,
+              mediaSignature: preflightResult.mediaSignature,
+              reportedFileSize: preflightResult.reportedFileSize,
+              probe2Start: preflightResult.probe2Start,
+              probe2Bytes: preflightResult.probe2Bytes,
+            });
+          }
+        }
         resultById.set(stream.id, preflightResult);
 
         let host = 'unknown';
@@ -4345,6 +4679,11 @@ class StreamFilterer {
           reason: preflightResult.reason,
           mediaBytes: preflightResult.mediaBytes,
           mediaSignature: preflightResult.mediaSignature,
+          expectedFileSize: preflightResult.expectedFileSize,
+          reportedFileSize: preflightResult.reportedFileSize,
+          probe2Start: preflightResult.probe2Start,
+          probe2Bytes: preflightResult.probe2Bytes,
+          cacheHit: preflightResult.cacheHit,
         });
       }
     };
