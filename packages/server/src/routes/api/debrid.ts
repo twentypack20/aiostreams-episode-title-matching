@@ -907,6 +907,23 @@ const resolveExternalResolverChain = async (
           const manifestResponse =
             mediaSignature === 'hls-playlist' ||
             mediaSignature === 'dash-manifest';
+          let validationHost = 'unknown';
+          try {
+            validationHost = new URL(currentUrl).host;
+          } catch {}
+          logger.debug('External resolver media validation probe 1', {
+            host: validationHost,
+            requestedStart: 0,
+            requestedEnd: externalResolverConfig.probeBytes - 1,
+            httpStatus: status,
+            received: bytes.length,
+            contentRangeStart: firstRange?.start,
+            contentRangeEnd: firstRange?.end,
+            contentRangeTotal: firstRange?.total,
+            signature: mediaSignature,
+            expectedFileSize,
+            reportedFileSize,
+          });
 
           if (externalResolverPrefixLooksTextual(bytes)) {
             const text = new TextDecoder('utf-8', { fatal: false })
@@ -955,6 +972,7 @@ const resolveExternalResolverChain = async (
 
           let probe2Start: number | undefined;
           let probe2BytesLength: number | undefined;
+          let finalReportedFileSize = reportedFileSize;
 
           if (!manifestResponse) {
             probe2Start = getExternalResolverSecondProbeStart(
@@ -998,6 +1016,17 @@ const resolveExternalResolverChain = async (
                 ?.split(';')[0]
                 .trim()
                 .toLowerCase() ?? '';
+            logger.debug('External resolver media validation probe 2 headers', {
+              host: validationHost,
+              requestedStart: probe2Start,
+              requestedEnd: probe2End,
+              httpStatus: probe2Response.status,
+              contentRangeStart: probe2Range?.start,
+              contentRangeEnd: probe2Range?.end,
+              contentRangeTotal: probe2Range?.total,
+              expectedFileSize,
+              reportedFileSize,
+            });
 
             if (
               probe2Response.status !== 206 ||
@@ -1031,6 +1060,17 @@ const resolveExternalResolverChain = async (
               externalResolverConfig.probeBytes
             );
             probe2BytesLength = probe2Bytes.length;
+            logger.debug('External resolver media validation probe 2 body', {
+              host: validationHost,
+              requestedStart: probe2Start,
+              requestedEnd: probe2End,
+              received: probe2Bytes.length,
+              contentRangeStart: probe2Range.start,
+              contentRangeEnd: probe2Range.end,
+              contentRangeTotal: probe2Range.total,
+              expectedFileSize,
+              reportedFileSize,
+            });
 
             if (probe2Bytes.length < externalResolverConfig.probeBytes) {
               throw new ExternalResolverError(
@@ -1064,18 +1104,28 @@ const resolveExternalResolverChain = async (
                 502
               );
             }
+
+            finalReportedFileSize ??= probe2Range.total;
+            if (
+              expectedFileSize !== undefined &&
+              finalReportedFileSize !== undefined &&
+              !externalResolverSizesAreClose(
+                expectedFileSize,
+                finalReportedFileSize
+              )
+            ) {
+              throw new ExternalResolverError(
+                `External resolver media size ${finalReportedFileSize} does not match expected file size ${expectedFileSize}`,
+                false,
+                502
+              );
+            }
           }
 
           logger.debug('External resolver media validation passed', {
-            host: (() => {
-              try {
-                return new URL(currentUrl).host;
-              } catch {
-                return 'unknown';
-              }
-            })(),
+            host: validationHost,
             expectedFileSize,
-            reportedFileSize,
+            reportedFileSize: finalReportedFileSize,
             probe1Bytes: bytes.length,
             signature: mediaSignature,
             probe2Start,

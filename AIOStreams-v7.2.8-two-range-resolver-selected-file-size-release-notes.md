@@ -14,13 +14,12 @@ episode inside a 15.38 GB season pack could therefore be removed by an 8 GB unca
 limit even though the selected episode itself was small.
 
 v7.2.8 adds a shared selected-file-size helper. `UNCACHED_MAX_SIZE_GB` is now applied
-only when AIOStreams has evidence that `stream.size` represents a specific file, such
-as:
-
-- a separate, larger `folderSize` is present;
-- an explicit torrent `fileIdx` identifies one file; or
-- a season-pack resolver result exposes an exact episode filename with exactly one
-  parsed episode number.
+only when AIOStreams has evidence that `stream.size` represents a specific file.
+For season packs, the safe evidence used by v7.2.8 is a separate, materially larger
+`folderSize`, which distinguishes the parent pack from the selected file. A `fileIdx`
+or episode-looking filename identifies *which* file is wanted but does not, by itself,
+prove that `stream.size` is the individual-file size, so those fields alone are not
+used to enforce the cap or resolver size check.
 
 If a season pack exposes only its whole-pack size and the individual file size cannot
 be trusted, the special uncached cap does **not** remove it.
@@ -63,7 +62,8 @@ single seekable media files.
 
 When AIOStreams has a trustworthy selected-file size, it is carried into the external
 resolver playback wrapper. The resolver-reported total media size must be reasonably
-close to that expected file size.
+close to that expected file size. The comparison is made when either Range probe
+provides a trustworthy total size.
 
 This is designed to reject cases such as:
 
@@ -85,9 +85,11 @@ individual file size is unknown.
 ### 4. Successful resolver validation is cached briefly
 
 Successful two-probe validations are cached in memory for 10 minutes using the
-provider/torrent/file identity when available. Reopening the same episode shortly
-after a successful check therefore does not repeatedly spend another ~128 KiB of VPS
-bandwidth validating the same candidate.
+provider/torrent/file identity, expected selected-file size, and the actual resolver
+target URL. A changed/new resolver target therefore cannot inherit a prior target's
+success merely because the torrent hash/file identity matches. Reopening the same
+episode shortly after a successful check avoids repeating another ~128 KiB validation
+for an unchanged candidate.
 
 Failed and inconclusive checks are not cached.
 
@@ -103,8 +105,10 @@ Debug logs for final resolver preflight now include, when available:
 - `probe2Bytes`
 - `cacheHit`
 
-The playback-time wrapper logs the same core validation facts under
-`External resolver media validation passed`.
+Both listing preflight and click-time playback validation log probe-1 and probe-2
+request/response details (requested offset, status, received bytes, and Content-Range)
+plus a final verdict. The playback-time wrapper also logs the final successful facts
+under `External resolver media validation passed`.
 
 ## Environment variables
 

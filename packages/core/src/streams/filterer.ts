@@ -4256,6 +4256,24 @@ class StreamFilterer {
             const manifestResponse =
               mediaSignature === 'hls-playlist' ||
               mediaSignature === 'dash-manifest';
+            let validationHost = 'unknown';
+            try {
+              validationHost = new URL(url).host;
+            } catch {}
+            logger.debug('Resolver media validation probe 1', {
+              id,
+              host: validationHost,
+              requestedStart: 0,
+              requestedEnd: resolverProbeBytes - 1,
+              httpStatus: status,
+              received: bytes.length,
+              contentRangeStart: firstRange?.start,
+              contentRangeEnd: firstRange?.end,
+              contentRangeTotal: firstRange?.total,
+              signature: mediaSignature,
+              expectedFileSize,
+              reportedFileSize,
+            });
 
             if (looksMostlyText(bytes)) {
               const bodyLower = decodeSnippet(bytes).toLowerCase();
@@ -4362,6 +4380,18 @@ class StreamFilterer {
             const probe2Range = parseContentRange(
               probe2Response.headers.get('content-range')
             );
+            logger.debug('Resolver media validation probe 2 headers', {
+              id,
+              host: validationHost,
+              requestedStart: probe2Start,
+              requestedEnd: probe2End,
+              httpStatus: probe2Status,
+              contentRangeStart: probe2Range?.start,
+              contentRangeEnd: probe2Range?.end,
+              contentRangeTotal: probe2Range?.total,
+              expectedFileSize,
+              reportedFileSize,
+            });
 
             if (
               probe2Status !== 206 ||
@@ -4405,6 +4435,18 @@ class StreamFilterer {
               resolverProbeBytes
             );
             probingResolverMediaBody = false;
+            logger.debug('Resolver media validation probe 2 body', {
+              id,
+              host: validationHost,
+              requestedStart: probe2Start,
+              requestedEnd: probe2End,
+              received: probe2Bytes.length,
+              contentRangeStart: probe2Range.start,
+              contentRangeEnd: probe2Range.end,
+              contentRangeTotal: probe2Range.total,
+              expectedFileSize,
+              reportedFileSize,
+            });
 
             if (probe2Bytes.length < resolverProbeBytes) {
               return {
@@ -4453,12 +4495,31 @@ class StreamFilterer {
               };
             }
 
+            const finalReportedFileSize =
+              reportedFileSize ?? secondReportedTotal;
+            if (
+              expectedFileSize !== undefined &&
+              finalReportedFileSize !== undefined &&
+              !sizesAreReasonablyClose(expectedFileSize, finalReportedFileSize)
+            ) {
+              return {
+                status: 'failed',
+                reason: `Preflight failed: resolver media size ${formatBytes(finalReportedFileSize, 1000)} does not match expected file size ${formatBytes(expectedFileSize, 1000)}`,
+                mediaBytes: bytes.length,
+                mediaSignature,
+                expectedFileSize,
+                reportedFileSize: finalReportedFileSize,
+                probe2Start,
+                probe2Bytes: probe2Bytes.length,
+              };
+            }
+
             return {
               status: 'passed',
               mediaBytes: bytes.length,
               mediaSignature,
               expectedFileSize,
-              reportedFileSize: reportedFileSize ?? secondReportedTotal,
+              reportedFileSize: finalReportedFileSize,
               probe2Start,
               probe2Bytes: probe2Bytes.length,
             };
@@ -4514,10 +4575,10 @@ class StreamFilterer {
               }
               if ('nestedResolverUrl' in classified) {
                 return inspectUrl(
-              classified.nestedResolverUrl,
-              redirectDepth + 1,
-              expectedFileSize
-            );
+                  classified.nestedResolverUrl,
+                  redirectDepth + 1,
+                  expectedFileSize
+                );
               }
               return classified;
             }
@@ -4534,10 +4595,10 @@ class StreamFilterer {
             }
             if ('nestedResolverUrl' in classified) {
               return inspectUrl(
-              classified.nestedResolverUrl,
-              redirectDepth + 1,
-              expectedFileSize
-            );
+                classified.nestedResolverUrl,
+                redirectDepth + 1,
+                expectedFileSize
+              );
             }
             return classified;
           }
@@ -4601,15 +4662,20 @@ class StreamFilterer {
 
     const getPreflightCacheKey = (
       stream: ParsedStream,
-      url: string
+      url: string,
+      expectedFileSize?: number
     ): string => {
       const service = stream.service?.id ?? 'unknown';
       const hash = stream.torrent?.infoHash?.toLowerCase();
       const fileIdx = stream.torrent?.fileIdx;
-      if (hash) {
-        return `${service}:${hash}:${fileIdx ?? '-'}:${stream.filename ?? '-'}`;
-      }
-      return `${service}:${url}`;
+      const fileIdentity = hash
+        ? `${hash}:${fileIdx ?? '-'}:${stream.filename ?? '-'}`
+        : stream.filename ?? '-';
+
+      // Include the actual resolver target and the size expectation. A newly
+      // issued/changed resolver URL must not inherit a successful validation
+      // from a different target merely because it points at the same torrent.
+      return `${service}:${fileIdentity}:${expectedFileSize ?? '-'}:${url}`;
     };
 
     const worker = async (): Promise<void> => {
@@ -4621,7 +4687,11 @@ class StreamFilterer {
         if (!url) continue;
 
         const expectedFileSize = getTrustedSelectedFileSize(stream);
-        const cacheKey = getPreflightCacheKey(stream, url);
+        const cacheKey = getPreflightCacheKey(
+          stream,
+          url,
+          expectedFileSize
+        );
         const cachedValidation = resolverPreflightSuccessCache.get(cacheKey);
         let preflightResult: PreflightResult;
 

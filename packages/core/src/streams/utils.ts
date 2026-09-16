@@ -26,20 +26,12 @@ export function getTrustedSelectedFileSize(
     return size;
   }
 
-  // An explicit torrent file index identifies one file inside the pack.
-  if (stream.torrent?.fileIdx !== undefined) return size;
-
-  // Resolver-style season-pack entries commonly retain the parent folder but
-  // expose the exact episode filename and parse exactly one episode number.
-  // In that shape, `size` is the selected episode file size.
-  if (
-    stream.filename &&
-    stream.parsedFile.episodes?.length === 1 &&
-    (!stream.folderName || stream.filename !== stream.folderName)
-  ) {
-    return size;
-  }
-
+  // A file index or episode-looking filename identifies *which* file is wanted,
+  // but it does not prove where `stream.size` came from. Some external addons
+  // keep the parent torrent size while also supplying fileIdx/filename. Trusting
+  // those fields alone would recreate the season-pack bug this helper exists to
+  // prevent. If the per-file size cannot be distinguished from the pack size,
+  // fail open and leave size-based filtering/validation disabled for this stream.
   return undefined;
 }
 
