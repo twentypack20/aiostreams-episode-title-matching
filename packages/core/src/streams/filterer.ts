@@ -374,6 +374,18 @@ class StreamFilterer {
       process.env.TORRENTIO_ANIME_RESOLVE_MODE || 'allow'
     ).toLowerCase();
 
+    // Custom safeguard for uncached debrid results. Downloading a very large
+    // uncached torrent can be wasteful (especially season packs), while an
+    // already-cached result is instant and should not be penalised by this
+    // separate limit. Set UNCACHED_MAX_SIZE_GB=0 to disable it.
+    const uncachedMaxSizeGbRaw = Number(
+      process.env.UNCACHED_MAX_SIZE_GB ?? '8'
+    );
+    const uncachedMaxSizeBytes =
+      Number.isFinite(uncachedMaxSizeGbRaw) && uncachedMaxSizeGbRaw > 0
+        ? uncachedMaxSizeGbRaw * 1_000_000_000
+        : undefined;
+
     // One physical torrent file can arrive through several playback routes
     // (for example native AIOStreams plus Torrentio/TorBox resolver copies).
     // If any copy already has provider/container-verified audio languages, make
@@ -3372,6 +3384,20 @@ class StreamFilterer {
         }
       }
 
+      if (
+        uncachedMaxSizeBytes !== undefined &&
+        stream.type === 'debrid' &&
+        stream.service?.cached === false &&
+        stream.size !== undefined &&
+        stream.size > uncachedMaxSizeBytes
+      ) {
+        this.incrementRemovalReason(
+          'size',
+          `Uncached > ${formatBytes(uncachedMaxSizeBytes, 1000)}`
+        );
+        return false;
+      }
+
       const globalBitrateRange = this.userData.bitrate?.global;
       const resolutionBitrateRange = stream.parsedFile?.resolution
         ? // @ts-ignore
@@ -3650,6 +3676,12 @@ class StreamFilterer {
       1,
       10
     );
+    const resolverMinMediaBytes = numberEnv(
+      process.env.EXTERNAL_RESOLVER_MIN_MEDIA_BYTES,
+      32 * 1024,
+      1024,
+      256 * 1024
+    );
     const inconclusiveMode = (
       process.env.PLAYBACK_PREFLIGHT_INCONCLUSIVE_MODE ??
       process.env.ANIME_PREFLIGHT_INCONCLUSIVE_MODE ??
@@ -3660,6 +3692,8 @@ class StreamFilterer {
     type PreflightResult = {
       status: PreflightStatus;
       reason?: string;
+      mediaBytes?: number;
+      mediaSignature?: string;
     };
 
     const getPreflightUrl = (stream: ParsedStream): string | undefined => {
@@ -3800,6 +3834,98 @@ class StreamFilterer {
       contentType.includes('json') ||
       contentType.includes('problem+json');
 
+    const startsWithBytes = (
+      bytes: Uint8Array,
+      signature: number[],
+      offset: number = 0
+    ): boolean =>
+      bytes.length >= offset + signature.length &&
+      signature.every((value, index) => bytes[offset + index] === value);
+
+    const detectMediaSignature = (
+      bytes: Uint8Array,
+      contentType: string
+    ): string | undefined => {
+      if (bytes.length === 0) return undefined;
+
+      if (
+        /application\/(?:vnd\.apple\.mpegurl|x-mpegurl)/.test(contentType)
+      ) {
+        const text = decodeSnippet(bytes);
+        return /^#EXTM3U/i.test(text) ? 'hls-playlist' : undefined;
+      }
+      if (contentType.includes('dash+xml')) {
+        const text = decodeSnippet(bytes);
+        return /<MPD(?:\s|>)/i.test(text) ? 'dash-manifest' : undefined;
+      }
+
+      if (startsWithBytes(bytes, [0x1a, 0x45, 0xdf, 0xa3])) {
+        return 'matroska/webm';
+      }
+      if (
+        bytes.length >= 12 &&
+        String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp'
+      ) {
+        return 'mp4/quicktime';
+      }
+      if (
+        startsWithBytes(bytes, [0x52, 0x49, 0x46, 0x46]) &&
+        bytes.length >= 12 &&
+        String.fromCharCode(...bytes.slice(8, 12)) === 'AVI '
+      ) {
+        return 'avi';
+      }
+      if (startsWithBytes(bytes, [0x4f, 0x67, 0x67, 0x53])) return 'ogg';
+      if (startsWithBytes(bytes, [0x46, 0x4c, 0x56])) return 'flv';
+      if (
+        startsWithBytes(bytes, [0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11])
+      ) {
+        return 'asf/wmv';
+      }
+      if (startsWithBytes(bytes, [0x49, 0x44, 0x33])) return 'mp3-id3';
+      if (
+        bytes.length >= 2 &&
+        bytes[0] === 0xff &&
+        (bytes[1] & 0xe0) === 0xe0
+      ) {
+        return 'mpeg-audio/aac';
+      }
+      if (
+        bytes.length >= 377 &&
+        bytes[0] === 0x47 &&
+        bytes[188] === 0x47 &&
+        bytes[376] === 0x47
+      ) {
+        return 'mpeg-ts';
+      }
+      if (
+        startsWithBytes(bytes, [0x00, 0x00, 0x01, 0xba]) ||
+        startsWithBytes(bytes, [0x00, 0x00, 0x01, 0xb3]) ||
+        startsWithBytes(bytes, [0x00, 0x00, 0x00, 0x01]) ||
+        startsWithBytes(bytes, [0x00, 0x00, 0x01])
+      ) {
+        return 'mpeg/annex-b';
+      }
+      return undefined;
+    };
+
+    const looksMostlyText = (bytes: Uint8Array): boolean => {
+      const sample = bytes.slice(0, Math.min(bytes.length, 1024));
+      if (sample.length === 0) return false;
+      let printable = 0;
+      for (const byte of sample) {
+        if (
+          byte === 0x09 ||
+          byte === 0x0a ||
+          byte === 0x0d ||
+          (byte >= 0x20 && byte <= 0x7e)
+        ) {
+          printable++;
+        }
+      }
+      return printable / sample.length >= 0.85;
+    };
+
     const isResolverUrl = (url: string): boolean =>
       /\/api\/v1\/debrid\/(?:playback|external-resolver)\//i.test(url) ||
       isKnownExternalResolverHopUrl(url);
@@ -3913,6 +4039,15 @@ class StreamFilterer {
             Accept:
               'video/*, audio/*, application/octet-stream, application/vnd.apple.mpegurl, application/dash+xml, application/json, text/plain, */*;q=0.5',
             'User-Agent': 'AIOStreams resolver preflight',
+            ...(resolverRoute && isKnownExternalResolverHopUrl(url)
+              ? { Range: `bytes=0-${resolverMinMediaBytes - 1}` }
+              : {}),
+            ...(resolverRoute && this.userData.ip
+              ? {
+                  'X-Forwarded-For': this.userData.ip,
+                  'X-Real-IP': this.userData.ip,
+                }
+              : {}),
           },
           redirect: 'manual',
           signal: controller.signal,
@@ -4006,23 +4141,57 @@ class StreamFilterer {
         }
 
         if (isMediaContentType(contentType)) {
-          // Torrentio and similar resolver hosts can return media headers
-          // immediately even when the body will never produce a playable byte.
-          // For known resolver-hop hosts, require one body byte before calling
-          // the route playable. This remains intentionally limited to resolver
-          // hosts; direct debrid/CDN URLs are never consumed by the VPS.
+          // v7.2.7: A one-byte probe was too weak: an unhealthy Torrentio-style
+          // resolver could emit a byte/header and then stall forever in Stremio.
+          // For known resolver-hop hosts, require a meaningful prefix quickly
+          // and validate a common media/container signature. Direct final
+          // debrid/CDN URLs are still never consumed by the VPS.
           if (resolverRoute && isKnownExternalResolverHopUrl(url)) {
             probingResolverMediaBody = true;
-            const bytes = await readBodySnippet(response, 1);
+            const bytes = await readBodySnippet(
+              response,
+              resolverMinMediaBytes
+            );
             probingResolverMediaBody = false;
-            if (bytes.length === 0) {
+
+            const mediaSignature = detectMediaSignature(bytes, contentType);
+            const manifestResponse =
+              mediaSignature === 'hls-playlist' ||
+              mediaSignature === 'dash-manifest';
+
+            if (looksMostlyText(bytes)) {
+              const bodyLower = decodeSnippet(bytes).toLowerCase();
+              if (errorBodyPattern.test(bodyLower)) {
+                return {
+                  status: 'failed',
+                  reason: 'Preflight failed: resolver returned an error body with media headers',
+                  mediaBytes: bytes.length,
+                };
+              }
+            }
+
+            if (!manifestResponse && bytes.length < resolverMinMediaBytes) {
               return {
                 status: 'failed',
-                reason:
-                  'Preflight failed: resolver returned media headers but no media bytes',
+                reason: `Preflight failed: resolver produced only ${bytes.length} of ${resolverMinMediaBytes} required media bytes`,
+                mediaBytes: bytes.length,
+                mediaSignature,
               };
             }
-            return { status: 'passed' };
+
+            if (!mediaSignature) {
+              return {
+                status: 'failed',
+                reason: 'Preflight failed: resolver media prefix did not match a known media/container signature',
+                mediaBytes: bytes.length,
+              };
+            }
+
+            return {
+              status: 'passed',
+              mediaBytes: bytes.length,
+              mediaSignature,
+            };
           }
 
           try {
@@ -4174,6 +4343,8 @@ class StreamFilterer {
           route: isResolverUrl(url) ? 'resolver' : 'direct',
           status: preflightResult.status,
           reason: preflightResult.reason,
+          mediaBytes: preflightResult.mediaBytes,
+          mediaSignature: preflightResult.mediaSignature,
         });
       }
     };

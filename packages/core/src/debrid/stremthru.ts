@@ -970,62 +970,69 @@ export class StremThruService
       });
     }
 
+    if (magnetDownload.status === 'cached' && magnetDownload.id) {
+      // Some StremThru providers can report an item as instant/cached before
+      // the add call returns the fully materialised library record. Refresh it
+      // once so an already-ready torrent can still play immediately.
+      try {
+        const refreshed = await this.getMagnet(magnetDownload.id.toString());
+        if (refreshed.status === 'downloaded') {
+          magnetDownload = refreshed;
+        }
+      } catch (error) {
+        logger.debug('Failed to refresh cached torrent immediately after add', {
+          service: this.serviceName,
+          id: magnetDownload.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     if (magnetDownload.status !== 'downloaded') {
       StremThruService.playbackLinkCache.set(cacheKey, null, 60);
+
+      if (['failed', 'invalid'].includes(magnetDownload.status)) {
+        const err = new DebridError(
+          `Magnet download ${magnetDownload.status}`,
+          {
+            statusCode: 400,
+            statusText: `Magnet download ${magnetDownload.status}`,
+            code: 'UNKNOWN',
+            headers: {},
+            body: magnetDownload,
+          }
+        );
+        DebridFailureCache.mark(
+          this.serviceName,
+          'torrent',
+          hash,
+          err
+        ).catch(() => {});
+        throw err;
+      }
+
       if (!cacheAndPlay) {
         return undefined;
       }
-      const pollingInterval = this.cacheAndPlayOptions.pollingInterval;
-      const maxPolls = Math.ceil(
-        this.cacheAndPlayOptions.maxWaitTime / pollingInterval
-      );
-      for (let i = 0; i < maxPolls; i++) {
-        await new Promise((resolve) => setTimeout(resolve, pollingInterval));
-        const list = await this.listMagnets();
-        const magnetDownloadInList = list.find(
-          (magnet) => magnet.hash === hash
-        );
-        if (!magnetDownloadInList) {
-          logger.warn(`Failed to find ${hash} in list`);
-        } else {
-          logger.debug(`Polled status for ${hash}`, {
-            attempt: i + 1,
-            status: magnetDownloadInList.status,
-          });
-          if (magnetDownloadInList.status === 'downloaded') {
-            magnetDownload = magnetDownloadInList;
-            break;
-          }
-          if (['failed', 'invalid'].includes(magnetDownloadInList.status)) {
-            const err = new DebridError(
-              `Magnet download ${magnetDownloadInList.status}`,
-              {
-                statusCode: 400,
-                statusText: `Magnet download ${magnetDownloadInList.status}`,
-                code: 'UNKNOWN',
-                headers: {},
-                body: magnetDownloadInList,
-              }
-            );
-            DebridFailureCache.mark(
-              this.serviceName,
-              'torrent',
-              hash,
-              err
-            ).catch(() => {});
-            throw err;
-          }
-        }
-      }
-      if (magnetDownload.status !== 'downloaded') {
-        throw new DebridError(`Timed out waiting for magnet to download`, {
-          statusCode: 408,
-          statusText: `Timed out waiting for magnet to download`,
-          code: 'UNKNOWN',
-          headers: {},
-          body: magnetDownload,
-        });
-      }
+
+      // v7.2.7: Do not hold the Stremio player on a spinner while waiting for
+      // an uncached torrent to finish. The provider has already accepted the
+      // torrent; return a distinct in-progress state immediately so the server
+      // can show the long-lived "downloading" information clip. The debrid
+      // provider continues downloading independently after this request ends.
+      logger.info('Cache-and-Play torrent is still downloading; returning immediately', {
+        service: this.serviceName,
+        hash: hash.slice(0, 10),
+        status: magnetDownload.status,
+        id: magnetDownload.id,
+      });
+      throw new DebridError('Magnet download is in progress', {
+        statusCode: 202,
+        statusText: 'Magnet download is in progress',
+        code: 'DOWNLOAD_IN_PROGRESS',
+        headers: {},
+        body: magnetDownload,
+      });
     }
 
     if (!magnetDownload.files?.length) {

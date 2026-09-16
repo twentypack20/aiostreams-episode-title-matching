@@ -214,7 +214,17 @@ const isCacheAndPlayDownloadTimeout = (error: unknown): boolean => {
   );
 };
 
+const isCacheAndPlayDownloadInProgress = (error: unknown): boolean =>
+  error instanceof DebridError && error.code === 'DOWNLOAD_IN_PROGRESS';
+
 const classifyResolveError = (error: unknown): ResolveRetryDecision => {
+  if (isCacheAndPlayDownloadInProgress(error)) {
+    return {
+      retry: false,
+      reason: 'cache-and-play download is in progress',
+    };
+  }
+
   if (isCacheAndPlayDownloadTimeout(error)) {
     return {
       retry: false,
@@ -349,6 +359,12 @@ const externalResolverConfig = {
   fallbackToOriginal: parseBooleanEnv(
     process.env.EXTERNAL_RESOLVER_FALLBACK_TO_ORIGINAL,
     true
+  ),
+  minMediaBytes: parseIntegerEnv(
+    process.env.EXTERNAL_RESOLVER_MIN_MEDIA_BYTES,
+    32 * 1024,
+    1024,
+    256 * 1024
   ),
 };
 
@@ -508,6 +524,96 @@ const readFetchBodyPrefix = async (
   return combined;
 };
 
+const startsWithMediaBytes = (
+  bytes: Uint8Array,
+  signature: number[],
+  offset: number = 0
+): boolean =>
+  bytes.length >= offset + signature.length &&
+  signature.every((value, index) => bytes[offset + index] === value);
+
+const detectExternalResolverMediaSignature = (
+  bytes: Uint8Array,
+  contentType: string
+): string | undefined => {
+  if (bytes.length === 0) return undefined;
+
+  const decode = () =>
+    new TextDecoder('utf-8', { fatal: false }).decode(bytes).trim();
+
+  if (/application\/(?:vnd\.apple\.mpegurl|x-mpegurl)/.test(contentType)) {
+    return /^#EXTM3U/i.test(decode()) ? 'hls-playlist' : undefined;
+  }
+  if (contentType.includes('dash+xml')) {
+    return /<MPD(?:\s|>)/i.test(decode()) ? 'dash-manifest' : undefined;
+  }
+  if (startsWithMediaBytes(bytes, [0x1a, 0x45, 0xdf, 0xa3])) {
+    return 'matroska/webm';
+  }
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(4, 8)) === 'ftyp'
+  ) {
+    return 'mp4/quicktime';
+  }
+  if (
+    startsWithMediaBytes(bytes, [0x52, 0x49, 0x46, 0x46]) &&
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.slice(8, 12)) === 'AVI '
+  ) {
+    return 'avi';
+  }
+  if (startsWithMediaBytes(bytes, [0x4f, 0x67, 0x67, 0x53])) return 'ogg';
+  if (startsWithMediaBytes(bytes, [0x46, 0x4c, 0x56])) return 'flv';
+  if (
+    startsWithMediaBytes(bytes, [0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11])
+  ) {
+    return 'asf/wmv';
+  }
+  if (startsWithMediaBytes(bytes, [0x49, 0x44, 0x33])) return 'mp3-id3';
+  if (
+    bytes.length >= 2 &&
+    bytes[0] === 0xff &&
+    (bytes[1] & 0xe0) === 0xe0
+  ) {
+    return 'mpeg-audio/aac';
+  }
+  if (
+    bytes.length >= 377 &&
+    bytes[0] === 0x47 &&
+    bytes[188] === 0x47 &&
+    bytes[376] === 0x47
+  ) {
+    return 'mpeg-ts';
+  }
+  if (
+    startsWithMediaBytes(bytes, [0x00, 0x00, 0x01, 0xba]) ||
+    startsWithMediaBytes(bytes, [0x00, 0x00, 0x01, 0xb3]) ||
+    startsWithMediaBytes(bytes, [0x00, 0x00, 0x00, 0x01]) ||
+    startsWithMediaBytes(bytes, [0x00, 0x00, 0x01])
+  ) {
+    return 'mpeg/annex-b';
+  }
+  return undefined;
+};
+
+const externalResolverPrefixLooksTextual = (bytes: Uint8Array): boolean => {
+  const sample = bytes.slice(0, Math.min(bytes.length, 1024));
+  if (sample.length === 0) return false;
+  let printable = 0;
+  for (const byte of sample) {
+    if (
+      byte === 0x09 ||
+      byte === 0x0a ||
+      byte === 0x0d ||
+      (byte >= 0x20 && byte <= 0x7e)
+    ) {
+      printable++;
+    }
+  }
+  return printable / sample.length >= 0.85;
+};
+
 const readFetchBodySnippet = async (
   response: Awaited<ReturnType<typeof fetch>>,
   maxBytes: number = 64 * 1024
@@ -632,6 +738,9 @@ const resolveExternalResolverChain = async (
         Accept:
           'video/*, audio/*, application/octet-stream, application/json, text/plain, */*;q=0.5',
         'User-Agent': 'AIOStreams external resolver playback',
+        ...(isKnownExternalResolverHopUrl(currentUrl)
+          ? { Range: `bytes=0-${externalResolverConfig.minMediaBytes - 1}` }
+          : {}),
         ...(clientIp
           ? {
               'X-Forwarded-For': clientIp,
@@ -711,14 +820,61 @@ const resolveExternalResolverChain = async (
     ) {
       if (isKnownExternalResolverHopUrl(currentUrl)) {
         try {
-          const bytes = await readFetchBodyPrefix(response, 1);
-          if (bytes.length === 0) {
+          const bytes = await readFetchBodyPrefix(
+            response,
+            externalResolverConfig.minMediaBytes
+          );
+          const mediaSignature = detectExternalResolverMediaSignature(
+            bytes,
+            contentType
+          );
+          const manifestResponse =
+            mediaSignature === 'hls-playlist' ||
+            mediaSignature === 'dash-manifest';
+
+          if (externalResolverPrefixLooksTextual(bytes)) {
+            const text = new TextDecoder('utf-8', { fatal: false })
+              .decode(bytes)
+              .trim();
+            if (resolverErrorBodyPattern.test(text)) {
+              throw new ExternalResolverError(
+                'External resolver returned an error body with media headers',
+                false,
+                502
+              );
+            }
+          }
+
+          if (
+            !manifestResponse &&
+            bytes.length < externalResolverConfig.minMediaBytes
+          ) {
             throw new ExternalResolverError(
-              'External resolver returned media headers but no media bytes',
+              `External resolver produced only ${bytes.length} of ${externalResolverConfig.minMediaBytes} required media bytes`,
+              false,
+              504
+            );
+          }
+
+          if (!mediaSignature) {
+            throw new ExternalResolverError(
+              'External resolver media prefix did not match a known media/container signature',
               false,
               502
             );
           }
+
+          logger.debug('External resolver media prefix validated', {
+            host: (() => {
+              try {
+                return new URL(currentUrl).host;
+              } catch {
+                return 'unknown';
+              }
+            })(),
+            bytes: bytes.length,
+            signature: mediaSignature,
+          });
         } catch (error) {
           if (error instanceof ExternalResolverError) throw error;
           const message =
@@ -728,7 +884,7 @@ const resolveExternalResolverChain = async (
             (error.name === 'AbortError' || /aborted|timeout/i.test(message))
           ) {
             throw new ExternalResolverError(
-              'External resolver media body produced no bytes before timeout',
+              `External resolver failed to produce ${externalResolverConfig.minMediaBytes} media bytes before timeout`,
               false,
               504
             );
@@ -1381,9 +1537,10 @@ router.get(
       }
 
       if (resolveError) {
-        const cacheAndPlayDownloadTimeout =
+        const cacheAndPlayDownloadState =
+          isCacheAndPlayDownloadInProgress(resolveError) ||
           isCacheAndPlayDownloadTimeout(resolveError);
-        let staticFile: string = cacheAndPlayDownloadTimeout
+        let staticFile: string = cacheAndPlayDownloadState
           ? StaticFiles.DOWNLOADING
           : StaticFiles.INTERNAL_SERVER_ERROR;
         if (resolveError instanceof DebridError) {
@@ -1416,6 +1573,9 @@ router.get(
           }
 
           switch (resolveError.code) {
+            case 'DOWNLOAD_IN_PROGRESS':
+              staticFile = StaticFiles.DOWNLOADING;
+              break;
             case 'UNAVAILABLE_FOR_LEGAL_REASONS':
               staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
               break;

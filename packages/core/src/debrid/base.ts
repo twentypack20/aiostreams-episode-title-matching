@@ -22,6 +22,7 @@ type DebridErrorCode =
   | 'UNKNOWN'
   | 'UNPROCESSABLE_ENTITY'
   | 'UNSUPPORTED_MEDIA_TYPE'
+  | 'DOWNLOAD_IN_PROGRESS'
   | 'NO_MATCHING_FILE';
 type DebridErrorType =
   | 'api_error'
@@ -83,6 +84,7 @@ const DEBRID_NON_RETRYABLE_CODES = new Set<DebridErrorCode | undefined>([
   'PAYMENT_REQUIRED',
   'STORE_LIMIT_EXCEEDED',
   'NOT_IMPLEMENTED',
+  'DOWNLOAD_IN_PROGRESS',
 ]);
 
 /**
