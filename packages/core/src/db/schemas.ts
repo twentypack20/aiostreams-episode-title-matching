@@ -1011,6 +1011,8 @@ export const ParsedStreamSchema = z.object({
   parsedFile: ParsedFileSchema.optional(),
   /** Indicates that audio/video metadata came from the actual provider/container rather than release-name parsing. */
   mediaInfoSource: z.enum(['provider', 'release']).optional(),
+  /** Internal marker for anime streams retained as an inferred original-language fallback after provider audio lookup returned no usable tracks. */
+  animeLanguageFallback: z.enum(['original-language-inferred']).optional(),
   message: z.string().max(1000).optional(),
   regexMatched: z
     .object({

@@ -124,17 +124,23 @@ class StreamSorter {
       });
     }
 
-    // v7.2.11: provider-verified Japanese-only anime streams are allowed as
-    // a last-resort fallback when English is required. Keep them below every
-    // normal unpinned English/dual-audio result regardless of the user's other
-    // anime sort criteria. The limiter runs after sorting, so a full English
-    // result set naturally pushes these fallback streams out of view.
+    // v7.2.11/v7.2.13: Japanese-only anime streams can survive Required
+    // English either because provider/container tracks verified Japanese-only,
+    // or because a TorBox media-info lookup returned no usable tracks and the
+    // ambiguous false-English release was safely downgraded to the title's known
+    // Japanese original language. Keep both fallback classes below every normal
+    // unpinned English/dual-audio result regardless of other anime sort criteria.
+    // The limiter runs after sorting, so a full English result set naturally
+    // pushes these fallback streams out of view.
     if (
       type === 'anime' &&
       this.userData.requiredLanguages?.includes('English' as any) &&
       !this.userData.requiredLanguages?.includes('Japanese' as any)
     ) {
-      const isVerifiedJapaneseOnlyFallback = (stream: ParsedStream): boolean => {
+      const isJapaneseOnlyFallback = (stream: ParsedStream): boolean => {
+        if (stream.animeLanguageFallback === 'original-language-inferred') {
+          return true;
+        }
         if (stream.mediaInfoSource !== 'provider') return false;
         const languages = stream.parsedFile?.languages ?? [];
         const languageSet = new Set(
@@ -144,18 +150,24 @@ class StreamSorter {
       };
 
       const japaneseOnlyFallbacks = sortedStreams.filter(
-        isVerifiedJapaneseOnlyFallback
+        isJapaneseOnlyFallback
       );
       if (japaneseOnlyFallbacks.length > 0) {
+        const inferred = japaneseOnlyFallbacks.filter(
+          (stream) =>
+            stream.animeLanguageFallback === 'original-language-inferred'
+        ).length;
         sortedStreams = [
-          ...sortedStreams.filter(
-            (stream) => !isVerifiedJapaneseOnlyFallback(stream)
-          ),
+          ...sortedStreams.filter((stream) => !isJapaneseOnlyFallback(stream)),
           ...japaneseOnlyFallbacks,
         ];
         logger.debug(
-          { demoted: japaneseOnlyFallbacks.length },
-          'demoted verified Japanese-only anime fallback streams'
+          {
+            demoted: japaneseOnlyFallbacks.length,
+            providerVerified: japaneseOnlyFallbacks.length - inferred,
+            inferredOriginalLanguage: inferred,
+          },
+          'demoted Japanese-only anime fallback streams'
         );
       }
     }

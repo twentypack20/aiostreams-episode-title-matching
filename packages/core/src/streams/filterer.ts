@@ -578,6 +578,8 @@ class StreamFilterer {
       );
     };
 
+    const torboxResolverAudioLookupAttemptedFiles = new Set<string>();
+
     if (
       providerMediaInfoConfig.enabled &&
       torboxResolverMediaInfoHashLimit > 0
@@ -608,6 +610,27 @@ class StreamFilterer {
                 .filter((check) => check.hash)
                 .map((check) => [check.hash!.toLowerCase(), check])
             );
+
+            // v7.2.13: remember the exact TorBox torrent files for which the
+            // selected-file media-info lookup was actually attempted. If the
+            // provider returns no usable audio tracks for one of these files,
+            // later language filtering can distinguish "provider unavailable"
+            // from "provider never checked" without pretending release-name
+            // guesses are authoritative.
+            for (const stream of candidates) {
+              const hash = stream.torrent?.infoHash?.toLowerCase();
+              const fileIdx = stream.torrent?.fileIdx;
+              if (
+                hash &&
+                fileIdx !== undefined &&
+                uniqueHashes.includes(hash)
+              ) {
+                torboxResolverAudioLookupAttemptedFiles.add(
+                  `${hash}:${fileIdx}`
+                );
+              }
+            }
+
             let enriched = 0;
             let japaneseOnly = 0;
             let englishConfirmed = 0;
@@ -2350,6 +2373,71 @@ class StreamFilterer {
       return languageSet.has('japanese') && !languageSet.has('english');
     };
 
+    const shouldInferJapaneseOriginalAnimeFallbackStream = (
+      stream: ParsedStream
+    ): boolean => {
+      if (!isAnime) return false;
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (this.userData.requiredLanguages?.includes('Japanese' as any)) {
+        return false;
+      }
+      if (originalLanguage?.toLowerCase() !== 'japanese') return false;
+      if (stream.mediaInfoSource === 'provider') return false;
+      if (stream.service?.id?.toLowerCase() !== 'torbox') return false;
+
+      const hash = stream.torrent?.infoHash?.toLowerCase();
+      const fileIdx = stream.torrent?.fileIdx;
+      if (!hash || fileIdx === undefined) return false;
+      if (!torboxResolverAudioLookupAttemptedFiles.has(`${hash}:${fileIdx}`)) {
+        return false;
+      }
+
+      const languages = stream.parsedFile?.languages?.length
+        ? stream.parsedFile.languages
+        : ['Unknown'];
+      const languageSet = new Set(
+        languages.map((language) => language.toLowerCase())
+      );
+
+      // This inference is deliberately narrow. It only repairs streams that
+      // currently claim English from ambiguous release/subtitle parsing, like
+      // "Dual Audio + Eng Subs". Unknown-only or unrelated foreign-language
+      // releases are still left conservative rather than being assumed Japanese.
+      if (!languageSet.has('english')) return false;
+      const inferenceEligibleLanguages = new Set([
+        'unknown',
+        'dual audio',
+        'multi',
+        'dubbed',
+        'english',
+        'japanese',
+        'original',
+      ]);
+      if (
+        [...languageSet].some(
+          (language) => !inferenceEligibleLanguages.has(language)
+        )
+      ) {
+        return false;
+      }
+
+      // Explicit English-audio/dub wording remains valid fallback evidence when
+      // TorBox cannot expose media_info. Only ambiguous/subtitle-derived English
+      // is downgraded to the known Japanese original language.
+      return !hasStrongEnglishAudioSignal(stream);
+    };
+
+    const shouldAllowInferredJapaneseOriginalAnimeFallbackStream = (
+      stream: ParsedStream
+    ): boolean =>
+      stream.animeLanguageFallback === 'original-language-inferred' &&
+      isAnime &&
+      originalLanguage?.toLowerCase() === 'japanese' &&
+      !!this.userData.requiredLanguages?.includes('English' as any) &&
+      !this.userData.requiredLanguages?.includes('Japanese' as any);
+
     const shouldAllowUnknownEnglishOriginalStream = (
       stream: ParsedStream
     ): boolean => {
@@ -2696,6 +2784,30 @@ class StreamFilterer {
 
     const shouldKeepStream = (stream: ParsedStream): boolean => {
       const file = stream.parsedFile;
+
+      // v7.2.13: if TorBox selected-file media-info was actually queried but
+      // returned no usable audio tracks, do not discard an otherwise valid
+      // Japanese-original anime stream merely because release parsing produced
+      // false English from ambiguous text such as "Dual Audio + Eng Subs".
+      // Replace that unverified release-language guess with the known original
+      // language and retain it only as a bottom-ranked inferred fallback.
+      if (
+        file &&
+        shouldInferJapaneseOriginalAnimeFallbackStream(stream)
+      ) {
+        file.languages = ['Japanese', 'Original'];
+        stream.animeLanguageFallback = 'original-language-inferred';
+        logEpisodeTitleDebug(
+          'Inferred Japanese-original anime fallback after TorBox audio lookup returned no usable tracks',
+          {
+            filename: stream.filename,
+            folderName: stream.folderName,
+            originalName: stream.originalName,
+            mediaInfoSource: stream.mediaInfoSource ?? 'release',
+            originalLanguage,
+          }
+        );
+      }
 
       const skipLanguageFiltering = shouldPassthroughStage(stream, 'language');
       const skipSubtitleFiltering = shouldPassthroughStage(stream, 'subtitle');
@@ -3193,6 +3305,7 @@ class StreamFilterer {
         ) &&
         !shouldAllowUnknownEnglishOriginalStream(stream) &&
         !shouldAllowVerifiedJapaneseOnlyAnimeFallbackStream(stream) &&
+        !shouldAllowInferredJapaneseOriginalAnimeFallbackStream(stream) &&
         !shouldAllowAnimeSpecialUnknownLanguageFallbackStream(stream) &&
         !shouldAllowForeignOriginalUnknownLanguageFallbackStream(stream)
       ) {
@@ -3215,6 +3328,23 @@ class StreamFilterer {
             originalName: stream.originalName,
             parsedLanguages: file?.languages,
             mediaInfoSource: stream.mediaInfoSource,
+            originalLanguage,
+          }
+        );
+      }
+
+      if (
+        !skipLanguageFiltering &&
+        shouldAllowInferredJapaneseOriginalAnimeFallbackStream(stream)
+      ) {
+        logEpisodeTitleDebug(
+          'Language filter allowed inferred Japanese-original anime fallback stream',
+          {
+            filename: stream.filename,
+            folderName: stream.folderName,
+            originalName: stream.originalName,
+            parsedLanguages: file?.languages,
+            fallbackSource: stream.animeLanguageFallback,
             originalLanguage,
           }
         );
