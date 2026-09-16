@@ -235,7 +235,8 @@ export async function processStreams(
     selMs: number;
   };
 }> {
-  const { type, id } = context;
+  const { id } = context;
+  const type = context.contentType;
   let processedStreams = streams;
   let errors: AIOStreamsError[] = [];
 

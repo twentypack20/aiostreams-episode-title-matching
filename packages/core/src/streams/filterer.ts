@@ -376,7 +376,14 @@ class StreamFilterer {
     // Ensure late metadata-based anime promotion is visible before capturing
     // the request classification in local variables.
     await context.ensureAnimeClassification();
-    const { type, id, parsedId, isAnime } = context;
+    const { type: requestType, id, parsedId, isAnime } = context;
+    const type = context.contentType;
+    if (requestType !== type) {
+      logger.debug(
+        { id, requestType, contentType: type, isAnime },
+        'using semantic series type for episodic stream filtering'
+      );
+    }
     const episodeTitleDebug = process.env.EPISODE_TITLE_DEBUG === 'true';
     const boolEnv = (value: string | undefined): boolean =>
       /^(1|true|yes|on)$/i.test(value ?? '');

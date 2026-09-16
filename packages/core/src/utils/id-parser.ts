@@ -48,6 +48,31 @@ export interface ParsedId {
   ) => string;
 }
 
+/**
+ * Resolve the semantic media type for a parsed request. Some metadata addons
+ * expose episodic anime through Stremio's `movie` resource, but an ID carrying
+ * an explicit episode coordinate (S/E or absolute episode) is still a
+ * series/episode request. Keep the transport/resource type separate from the
+ * semantic type so external addons
+ * can continue receiving the route they expect while metadata/filtering use
+ * episode semantics.
+ */
+export function resolveEffectiveMediaType(
+  requestType: string,
+  parsedId:
+    | Pick<ParsedId, 'season' | 'episode' | 'absoluteEpisode'>
+    | null
+    | undefined
+): string {
+  if (
+    parsedId?.episode !== undefined ||
+    parsedId?.absoluteEpisode !== undefined
+  ) {
+    return 'series';
+  }
+  return requestType;
+}
+
 interface IdParserDefinition {
   type: IdType;
   externalType: ExternalIdType;

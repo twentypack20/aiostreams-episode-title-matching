@@ -6,7 +6,12 @@
   Stream,
 } from '../../db/schemas.js';
 import { z, ZodError } from 'zod';
-import { IdParser, IdType, ParsedId } from '../../utils/id-parser.js';
+import {
+  IdParser,
+  IdType,
+  ParsedId,
+  resolveEffectiveMediaType,
+} from '../../utils/id-parser.js';
 import {
   AnimeDatabase,
   BuiltinServiceId,
@@ -559,6 +564,23 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     type: string
   ): Promise<SearchMetadata> {
     const start = Date.now();
+    const effectiveType = resolveEffectiveMediaType(type, parsedId);
+
+    if (parsedId.mediaType !== effectiveType) {
+      this.logger.debug(
+        {
+          requestType: type,
+          effectiveType,
+          id: parsedId.fullId,
+          season: parsedId.season,
+          episode: parsedId.episode,
+        },
+        'normalised episodic builtin request to series semantics'
+      );
+      // Search implementations select movie-vs-TV endpoints from mediaType.
+      // Keep the outer addon route unchanged, but use series semantics below.
+      parsedId.mediaType = effectiveType;
+    }
 
     const animeEntry = AnimeDatabase.getInstance().getEntryById(
       parsedId.type,
@@ -583,7 +605,10 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       tmdbAccessToken: this.userData.tmdbReadAccessToken,
       tmdbApiKey: this.userData.tmdbApiKey,
       tvdbApiKey: this.userData.tvdbApiKey,
-    }).getMetadata(parsedId, type === 'movie' ? 'movie' : 'series');
+    }).getMetadata(
+      parsedId,
+      effectiveType === 'movie' ? 'movie' : 'series'
+    );
 
     // Calculate absolute episode if needed. Extended Kitsu bridge IDs provide
     // the provider/anime absolute episode explicitly.

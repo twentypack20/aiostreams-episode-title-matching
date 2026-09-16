@@ -10,6 +10,7 @@ import {
   createLogger,
   getSeaDexInfoHashes,
   enrichParsedIdWithAnimeEntry,
+  resolveEffectiveMediaType,
 } from '../utils/index.js';
 import { SeaDexResult } from '../utils/seadex.js';
 import { calculateAbsoluteEpisode } from '../builtins/utils/general.js';
@@ -112,6 +113,15 @@ export class StreamContext {
     return this._queryType;
   }
 
+  /**
+   * Semantic movie/series type. The incoming Stremio resource type is retained
+   * in `type` for addon compatibility, while explicit S/E coordinates always
+   * mean episode semantics.
+   */
+  public get contentType(): string {
+    return resolveEffectiveMediaType(this.type, this.parsedId);
+  }
+
   // Metadata (fetched from TMDB/TVDB/IMDB)
   private _metadata: ExtendedMetadata | undefined;
   private _metadataPromise: Promise<ExtendedMetadata | undefined> | undefined;
@@ -204,12 +214,14 @@ export class StreamContext {
       }
     }
 
-    const queryType = isAnime ? `anime.${type}` : type;
+    const contentType = resolveEffectiveMediaType(type, parsedId);
+    const queryType = isAnime ? `anime.${contentType}` : contentType;
 
     logger.debug(
       {
         id,
         type,
+        contentType,
         isAnime,
         hasAnimeEntry: !!animeEntry,
         animeClassificationSource,
@@ -234,7 +246,7 @@ export class StreamContext {
   ): void {
     const wasAnime = this._isAnime;
     this._isAnime = true;
-    this._queryType = `anime.${this.type}`;
+    this._queryType = `anime.${this.contentType}`;
     this._animeClassificationSource = source;
     if (animeEntry) {
       this._animeEntry = animeEntry;
@@ -248,6 +260,7 @@ export class StreamContext {
         {
           id: this.id,
           type: this.type,
+          contentType: this.contentType,
           source,
           hasAnimeEntry: !!this._animeEntry,
           queryType: this._queryType,
@@ -353,7 +366,7 @@ export class StreamContext {
 
         const metadata = await service.getMetadata(
           this.parsedId!,
-          this.type as any
+          this.contentType as any
         );
 
         // A fresh anime season can appear before one of the legacy relation
@@ -495,7 +508,7 @@ export class StreamContext {
         return undefined;
       }
 
-      if (this.type === 'movie') {
+      if (this.contentType === 'movie') {
         try {
           return await new TMDBMetadata({
             accessToken: this.userData.tmdbAccessToken,
@@ -532,7 +545,7 @@ export class StreamContext {
       (!digitalReleaseFilterEnabled &&
         !useMetadataRuntime &&
         !episodeTitleMatchingEnabled) ||
-      (this.type !== 'series' && !this.isAnime)
+      (this.contentType !== 'series' && !this.isAnime)
     ) {
       return;
     }
@@ -779,7 +792,7 @@ export class StreamContext {
   }
 
   private computeAgeInDays(): number | undefined {
-    if (this.type === 'series' && this._episodeDetails?.airDate) {
+    if (this.contentType === 'series' && this._episodeDetails?.airDate) {
       return this.getDaysSince(this._episodeDetails.airDate);
     } else if (this._metadata?.releaseDate) {
       return this.getDaysSince(this._metadata.releaseDate);

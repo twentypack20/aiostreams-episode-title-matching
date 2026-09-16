@@ -10,6 +10,7 @@ import {
   AnimeDatabase,
   IdParser,
   ParsedId,
+  resolveEffectiveMediaType,
   appConfig,
 } from '../utils/index.js';
 import { withRetry } from '../utils/general.js';
@@ -43,10 +44,31 @@ export class MetadataService {
     id: ParsedId,
     type: (typeof TYPES)[number]
   ): Promise<Metadata> {
+    const effectiveType = resolveEffectiveMediaType(
+      type,
+      id
+    ) as (typeof TYPES)[number];
+    const parsedMediaType = id.mediaType;
+
+    if (effectiveType !== type || parsedMediaType !== effectiveType) {
+      logger.debug(
+        {
+          id: id.fullId,
+          requestType: type,
+          parsedMediaType,
+          effectiveType,
+          season: id.season,
+          episode: id.episode,
+        },
+        'normalised episodic metadata request to series semantics'
+      );
+      id.mediaType = effectiveType;
+    }
+
     return withRetry(
       async () => {
         const { result } = await this.lock.withLock(
-          `metadata:${id.mediaType}:${id.type}:${id.value}:${id.season ?? '-'}:${id.episode ?? '-'}:${id.absoluteEpisode ?? '-'}${this.config.tmdbAccessToken || this.config.tmdbApiKey ? ':tmdb' : ''}${this.config.tvdbApiKey ? ':tvdb' : ''}`,
+          `metadata:${effectiveType}:${id.type}:${id.value}:${id.season ?? '-'}:${id.episode ?? '-'}:${id.absoluteEpisode ?? '-'}${this.config.tmdbAccessToken || this.config.tmdbApiKey ? ':tmdb' : ''}${this.config.tvdbApiKey ? ':tvdb' : ''}`,
           async () => {
             const start = Date.now();
             const titles: MetadataTitle[] = [];
@@ -91,7 +113,7 @@ export class MetadataService {
             let tvdbId: number | null =
               id.type === 'thetvdbId'
                 ? Number(id.value)
-                : animeEntry?.mappings?.thetvdbId && type === 'series'
+                : animeEntry?.mappings?.thetvdbId && effectiveType === 'series'
                   ? Number(animeEntry.mappings.thetvdbId)
                   : null;
 
@@ -114,7 +136,7 @@ export class MetadataService {
               ? `tmdb:${tmdbId}`
               : (imdbId ?? (tvdbId ? `tvdb:${tvdbId}` : null));
             const parsedIdForTmdb = idForTmdb
-              ? IdParser.parse(idForTmdb, type)
+              ? IdParser.parse(idForTmdb, effectiveType)
               : null;
             if (parsedIdForTmdb) {
               promises.push(
@@ -134,7 +156,7 @@ export class MetadataService {
               ? `tvdb:${tvdbId}`
               : (imdbId ?? (tmdbId ? `tmdb:${tmdbId}` : null));
             const parsedIdForTvdb = idForTvdb
-              ? IdParser.parse(idForTvdb, type)
+              ? IdParser.parse(idForTvdb, effectiveType)
               : null;
             if (parsedIdForTvdb) {
               promises.push(
@@ -165,8 +187,12 @@ export class MetadataService {
             // IMDb metadata
             if (imdbId) {
               const imdbMetadata = new IMDBMetadata();
-              promises.push(imdbMetadata.getCinemetaData(imdbId, type));
-              promises.push(imdbMetadata.getImdbSuggestionData(imdbId, type));
+              promises.push(
+                imdbMetadata.getCinemetaData(imdbId, effectiveType)
+              );
+              promises.push(
+                imdbMetadata.getImdbSuggestionData(imdbId, effectiveType)
+              );
             } else {
               promises.push(Promise.resolve(undefined));
               promises.push(Promise.resolve(undefined));
@@ -247,7 +273,12 @@ export class MetadataService {
               );
             }
 
-            if (!nextAirDate && type === 'series' && id.season && id.episode) {
+            if (
+              !nextAirDate &&
+              effectiveType === 'series' &&
+              id.season &&
+              id.episode
+            ) {
               try {
                 const tmdb = new TMDBMetadata({
                   accessToken: this.config.tmdbAccessToken,
@@ -430,7 +461,7 @@ export class MetadataService {
 
             if (
               !uniqueTitles.length ||
-              (year === undefined && id.mediaType === 'movie')
+              (year === undefined && effectiveType === 'movie')
             ) {
               throw new Error(`Could not find metadata for ${id.fullId}`);
             }
