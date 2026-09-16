@@ -124,6 +124,42 @@ class StreamSorter {
       });
     }
 
+    // v7.2.11: provider-verified Japanese-only anime streams are allowed as
+    // a last-resort fallback when English is required. Keep them below every
+    // normal unpinned English/dual-audio result regardless of the user's other
+    // anime sort criteria. The limiter runs after sorting, so a full English
+    // result set naturally pushes these fallback streams out of view.
+    if (
+      type === 'anime' &&
+      this.userData.requiredLanguages?.includes('English' as any) &&
+      !this.userData.requiredLanguages?.includes('Japanese' as any)
+    ) {
+      const isVerifiedJapaneseOnlyFallback = (stream: ParsedStream): boolean => {
+        if (stream.mediaInfoSource !== 'provider') return false;
+        const languages = stream.parsedFile?.languages ?? [];
+        const languageSet = new Set(
+          languages.map((language) => language.toLowerCase())
+        );
+        return languageSet.has('japanese') && !languageSet.has('english');
+      };
+
+      const japaneseOnlyFallbacks = sortedStreams.filter(
+        isVerifiedJapaneseOnlyFallback
+      );
+      if (japaneseOnlyFallbacks.length > 0) {
+        sortedStreams = [
+          ...sortedStreams.filter(
+            (stream) => !isVerifiedJapaneseOnlyFallback(stream)
+          ),
+          ...japaneseOnlyFallbacks,
+        ];
+        logger.debug(
+          { demoted: japaneseOnlyFallbacks.length },
+          'demoted verified Japanese-only anime fallback streams'
+        );
+      }
+    }
+
     const pinnedParts = [];
     if (pinnedToTopStreams.length > 0) {
       pinnedParts.push(`${pinnedToTopStreams.length} pinned to top`);

@@ -8,6 +8,7 @@ import {
   compileRegex,
   formRegexFromKeywords,
   isKnownExternalResolverHopUrl,
+  parseMediaInfo,
 } from '../utils/index.js';
 import { LANGUAGES, StreamType } from '../utils/constants.js';
 import {
@@ -28,7 +29,12 @@ import { formatBitrate, formatBytes } from '../formatters/utils.js';
 import { iso6391ToLanguage } from '../utils/languages.js';
 import { ReleaseDate } from '../metadata/tmdb.js';
 import { StreamContext, ExtendedMetadata } from './context.js';
-import { DebridFailureCache } from '../debrid/base.js';
+import {
+  DebridFailureCache,
+  getDebridService,
+  isTorrentDebridService,
+  providerMediaInfoConfig,
+} from '../debrid/index.js';
 
 const logger = createLogger('filterer');
 
@@ -507,6 +513,177 @@ class StreamFilterer {
         'Completed authoritative audio-language propagation across equivalent playback routes',
         { id, propagated: propagatedAuthoritativeLanguages }
       );
+    }
+
+    // v7.2.11: After reusing any provider metadata already present on an
+    // equivalent native route, Torrentio/TorBox resolver streams can still
+    // carry only vague release tags such as "Dual Audio" or "Unknown" even
+    // when TorBox knows the
+    // selected file's real container tracks. Before Required Language runs, ask
+    // TorBox's cache-status endpoint for those ambiguous anime candidates and
+    // use selected-file media_info when it is available. This is a read-only
+    // cache check (checkOwned=false); it does not add the torrent to the user's
+    // cloud. A single batched hash lookup covers many resolver streams.
+    const torboxResolverMediaInfoHashLimitRaw = Number(
+      process.env.TORBOX_RESOLVER_MEDIA_INFO_HASH_LIMIT ?? '40'
+    );
+    const torboxResolverMediaInfoHashLimit = Number.isFinite(
+      torboxResolverMediaInfoHashLimitRaw
+    )
+      ? Math.min(
+          100,
+          Math.max(0, Math.floor(torboxResolverMediaInfoHashLimitRaw))
+        )
+      : 40;
+
+    const isTorboxResolverAudioLookupCandidate = (
+      stream: ParsedStream
+    ): boolean => {
+      if (!isAnime) return false;
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (stream.mediaInfoSource === 'provider') return false;
+      if (stream.service?.id?.toLowerCase() !== 'torbox') return false;
+      if (!stream.torrent?.infoHash || stream.torrent.fileIdx === undefined) {
+        return false;
+      }
+
+      const languages = stream.parsedFile?.languages?.length
+        ? stream.parsedFile.languages
+        : ['Unknown'];
+      if (languages.includes('English' as any)) return false;
+
+      // Do not spend provider calls on releases that already explicitly claim a
+      // different non-English language (Chinese/French/etc.). Target only vague
+      // audio labels plus Japanese, which can become the verified fallback tier.
+      const lookupEligibleLanguages = new Set([
+        'Unknown',
+        'Dual Audio',
+        'Multi',
+        'Dubbed',
+        'Japanese',
+        'Original',
+      ]);
+      return languages.every((language) =>
+        lookupEligibleLanguages.has(language)
+      );
+    };
+
+    if (
+      providerMediaInfoConfig.enabled &&
+      torboxResolverMediaInfoHashLimit > 0
+    ) {
+      const torboxServiceConfig = this.userData.services?.find(
+        (service) => service.id === 'torbox' && service.enabled !== false
+      );
+      const torboxToken = torboxServiceConfig?.credentials?.apiKey;
+      const candidates = streams.filter(isTorboxResolverAudioLookupCandidate);
+
+      if (torboxToken && candidates.length > 0) {
+        const uniqueHashes = [
+          ...new Set(
+            candidates.map((stream) => stream.torrent!.infoHash!.toLowerCase())
+          ),
+        ].slice(0, torboxResolverMediaInfoHashLimit);
+
+        try {
+          const debridService = getDebridService('torbox', torboxToken);
+          if (isTorrentDebridService(debridService)) {
+            const checks = await debridService.checkMagnets(
+              uniqueHashes,
+              id,
+              false
+            );
+            const checksByHash = new Map(
+              checks
+                .filter((check) => check.hash)
+                .map((check) => [check.hash!.toLowerCase(), check])
+            );
+            let enriched = 0;
+            let japaneseOnly = 0;
+            let englishConfirmed = 0;
+
+            for (const stream of candidates) {
+              const hash = stream.torrent?.infoHash?.toLowerCase();
+              const fileIdx = stream.torrent?.fileIdx;
+              if (
+                !hash ||
+                fileIdx === undefined ||
+                !uniqueHashes.includes(hash)
+              ) {
+                continue;
+              }
+
+              const check = checksByHash.get(hash);
+              const providerFile = check?.files?.find(
+                (file) => Number(file.index ?? file.id) === Number(fileIdx)
+              );
+              const authoritativeMediaInfo = providerFile?.mediaInfo
+                ? parseMediaInfo(providerFile.mediaInfo)
+                : undefined;
+              const providerLanguages =
+                authoritativeMediaInfo?.languages?.filter(
+                  (language) => language !== 'Original'
+                );
+              if (!providerLanguages?.length) continue;
+
+              stream.parsedFile = {
+                ...(stream.parsedFile ?? {
+                  audioChannels: [],
+                  visualTags: [],
+                  audioTags: [],
+                  languages: [],
+                }),
+                languages: [...new Set(providerLanguages)],
+              };
+              stream.mediaInfoSource = 'provider';
+              enriched += 1;
+
+              const normalised = new Set(
+                providerLanguages.map((language) => language.toLowerCase())
+              );
+              if (normalised.has('english')) englishConfirmed += 1;
+              if (normalised.has('japanese') && !normalised.has('english')) {
+                japaneseOnly += 1;
+              }
+
+              logger.debug(
+                'Enriched TorBox resolver audio languages from provider/container metadata',
+                {
+                  id,
+                  addon: stream.addon.name,
+                  hashPrefix: hash.slice(0, 10),
+                  fileIdx,
+                  filename: stream.filename,
+                  providerLanguages,
+                }
+              );
+            }
+
+            logger.debug(
+              'Completed TorBox resolver provider audio-language enrichment',
+              {
+                id,
+                candidates: candidates.length,
+                uniqueHashes: uniqueHashes.length,
+                enriched,
+                englishConfirmed,
+                japaneseOnly,
+              }
+            );
+          }
+        } catch (error) {
+          logger.warn(
+            'TorBox resolver provider audio-language enrichment failed; keeping existing release metadata',
+            {
+              id,
+              candidates: candidates.length,
+              error: error instanceof Error ? error.message : String(error),
+            }
+          );
+        }
+      }
     }
 
     const start = Date.now();
@@ -2113,6 +2290,25 @@ class StreamFilterer {
       return !hasStrongEnglishAudioSignal(stream);
     };
 
+    const shouldAllowVerifiedJapaneseOnlyAnimeFallbackStream = (
+      stream: ParsedStream
+    ): boolean => {
+      if (!isAnime) return false;
+      if (!this.userData.requiredLanguages?.includes('English' as any)) {
+        return false;
+      }
+      if (this.userData.requiredLanguages?.includes('Japanese' as any)) {
+        return false;
+      }
+      if (stream.mediaInfoSource !== 'provider') return false;
+
+      const languages = stream.parsedFile?.languages ?? [];
+      const languageSet = new Set(
+        languages.map((language) => language.toLowerCase())
+      );
+      return languageSet.has('japanese') && !languageSet.has('english');
+    };
+
     const shouldAllowUnknownEnglishOriginalStream = (
       stream: ParsedStream
     ): boolean => {
@@ -2955,6 +3151,7 @@ class StreamFilterer {
           (file?.languages.length ? file.languages : ['Unknown']).includes(lang)
         ) &&
         !shouldAllowUnknownEnglishOriginalStream(stream) &&
+        !shouldAllowVerifiedJapaneseOnlyAnimeFallbackStream(stream) &&
         !shouldAllowAnimeSpecialUnknownLanguageFallbackStream(stream) &&
         !shouldAllowForeignOriginalUnknownLanguageFallbackStream(stream)
       ) {
@@ -2963,6 +3160,23 @@ class StreamFilterer {
           formatLanguageRemovalEvidence(stream, file?.languages)
         );
         return false;
+      }
+
+      if (
+        !skipLanguageFiltering &&
+        shouldAllowVerifiedJapaneseOnlyAnimeFallbackStream(stream)
+      ) {
+        logEpisodeTitleDebug(
+          'Language filter allowed verified Japanese-only anime fallback stream',
+          {
+            filename: stream.filename,
+            folderName: stream.folderName,
+            originalName: stream.originalName,
+            parsedLanguages: file?.languages,
+            mediaInfoSource: stream.mediaInfoSource,
+            originalLanguage,
+          }
+        );
       }
 
       if (
