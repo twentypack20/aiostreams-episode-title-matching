@@ -2633,9 +2633,6 @@ class StreamFilterer {
       if (isAIOStreamsDebridPlaybackStream(stream)) score += 1000;
       if (isTorrentioResolveStream(stream)) score -= 250;
 
-      if (stream.service?.id?.toLowerCase() === 'realdebrid') score += 80;
-      if (isTorboxStream(stream)) score -= 20;
-
       const encode = stream.parsedFile?.encode?.toLowerCase();
       const quality = stream.parsedFile?.quality?.toLowerCase();
       const fileText = normaliseStreamIdentity(
